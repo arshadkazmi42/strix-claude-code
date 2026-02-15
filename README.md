@@ -216,7 +216,7 @@ Install with: `npm install -g @anthropic-ai/claude-cli`
 ### Container fails to start
 Check if the strix sandbox image is available:
 ```bash
-docker pull ghcr.io/usestrix/strix-sandbox:0.1.10
+docker pull ghcr.io/usestrix/strix-sandbox:0.1.11
 ```
 
 ### Tools not responding

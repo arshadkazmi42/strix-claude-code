@@ -26,7 +26,7 @@ def get_cpu_count(reserve: int = 2) -> int:
     return available
 
 # Default strix sandbox image
-DEFAULT_SANDBOX_IMAGE = "ghcr.io/usestrix/strix-sandbox:0.1.10"
+DEFAULT_SANDBOX_IMAGE = "ghcr.io/usestrix/strix-sandbox:0.1.11"
 HOST_GATEWAY_HOSTNAME = "host.docker.internal"
 DOCKER_TIMEOUT = 60
 TOOL_SERVER_HEALTH_RETRIES = 10
