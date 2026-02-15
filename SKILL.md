@@ -146,12 +146,7 @@ process(action="list")
 Complete authentication bypass...
 
 #### Proof of Concept
-```python
-requests.post("http://target/login", json={
-    "email": "' OR 1=1--",
-    "password": "x"
-})
-```
+POST /login with {"email": "' OR 1=1--", "password": "x"}
 ```
 
 ## Ethical Use
