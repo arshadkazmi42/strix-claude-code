@@ -916,10 +916,11 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
             wrapper_initial = "START THE SECURITY ASSESSMENT NOW. Execute all phases automatically: reconnaissance, vulnerability testing, and reporting. Do NOT wait for user input. BEGIN IMMEDIATELY."
 
         wrapper_script.write_text(f'''#!/bin/bash
+export CLAUDE_CODE_SKIP_TRUST_DIALOG=1
 exec claude \\
     --mcp-config "{mcp_config_path}" \\
     --append-system-prompt "$(cat "{system_prompt_path}")" \\
-    --allow-dangerously-skip-permissions \\
+    --permission-mode bypassPermissions \\
     --dangerously-skip-permissions \\
     "{wrapper_initial}"
 ''')
@@ -1161,36 +1162,32 @@ Only after 3 clean passes:
 START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
 """
 
+        # Common claude args
+        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        claude_base_args = [
+            "claude",
+            "--mcp-config", str(mcp_config_path),
+            "--append-system-prompt", system_prompt,
+            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]
+
         # Check if we have a TTY for interactive mode
         if sys.stdin.isatty():
             # Run claude interactively with initial prompt
-            result = subprocess.run([
-                "claude",
-                "--mcp-config", str(mcp_config_path),
-                "--append-system-prompt", system_prompt,
-                "--allow-dangerously-skip-permissions",
-                "--dangerously-skip-permissions",
-                initial_prompt,  # Pass prompt as argument
-            ], cwd=temp_config_dir)
+            result = subprocess.run(
+                claude_base_args + [initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
         else:
-            # No TTY - print instructions for manual run
-            console.print(f"\n[bold yellow]No interactive terminal detected.[/bold yellow]")
-            console.print(f"\n[bold]To start the scan, run this command in your terminal:[/bold]")
-            console.print(f"\n  [green]{wrapper_script}[/green]\n")
-            console.print(f"[dim]Container will stay running. Stop with: docker stop {sandbox_info['container_name']}[/dim]")
-            console.print("=" * 60)
-
-            # Keep container running
-            keep_container = True
-
-            # Wait for user acknowledgment
-            console.print("\n[dim]Press Ctrl+C when done with the scan.[/dim]")
-            try:
-                import time
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                pass
+            # No TTY - run in non-interactive print mode
+            console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
+            result = subprocess.run(
+                claude_base_args + ["--print", initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Scan session ended.[/bold]")
