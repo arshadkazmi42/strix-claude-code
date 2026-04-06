@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from .github_org import fetch_org_repos, parse_org_from_url
 from .sandbox import Sandbox, SandboxError
 
 console = Console()
@@ -674,9 +675,126 @@ def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
     return clone_path
 
 
+def _handle_org_scan(
+    org_targets: list[dict[str, str]],
+    extra_targets: list[str],
+    scan_mode: str,
+    instruction: str | None,
+    output_file: str | None,
+    image: str | None,
+    mount_docker: bool,
+    verbose: bool,
+) -> None:
+    """Expand org targets into individual repo scans launched in parallel.
+
+    Each repo gets its own screen session via scan_manager.start_scan().
+    """
+    from datetime import datetime
+
+    from . import scan_manager
+
+    all_repos: list[dict] = []
+
+    for org_target in org_targets:
+        org_name = org_target["org"]
+        console.print(Panel(
+            f"[bold]Fetching repos from GitHub org:[/bold] [cyan]{org_name}[/cyan]\n"
+            f"[dim]Skipping: archived, disabled, forked, demo, example, sample, test repos[/dim]",
+            title="Org Scan",
+        ))
+
+        try:
+            with console.status(f"Fetching repos from {org_name}..."):
+                repos = fetch_org_repos(org_name)
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            sys.exit(1)
+        except Exception as e:
+            console.print(f"[red]Failed to fetch repos:[/red] {e}")
+            if verbose:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+
+        if not repos:
+            console.print(f"[yellow]No repos found for org {org_name} after filtering.[/yellow]")
+            continue
+
+        console.print(f"[green]Found {len(repos)} repos to scan:[/green]")
+        for i, repo in enumerate(repos, 1):
+            lang = repo["language"] or "unknown"
+            console.print(
+                f"  {i:3d}. [cyan]{repo['full_name']}[/cyan]  "
+                f"[dim]({lang}, {repo['stars']}★)[/dim]"
+            )
+
+        all_repos.extend(repos)
+
+    if not all_repos:
+        console.print("[yellow]No repos to scan.[/yellow]")
+        return
+
+    console.print()
+    total = len(all_repos)
+    console.print(Panel(
+        f"[bold]Launching {total} parallel scans[/bold]\n"
+        f"[dim]Mode: {scan_mode} | Each repo gets its own sandbox[/dim]",
+        title="Starting Org Scan",
+    ))
+
+    launched: list[dict] = []
+    for repo in all_repos:
+        repo_url = repo["clone_url"]
+        repo_name = repo["name"]
+
+        # Each repo gets its own output file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        repo_output = output_file
+        if not repo_output:
+            repo_output = str(Path.cwd() / f"strix_report_{repo_name}_{timestamp}.md")
+        else:
+            # If user specified an output file, make per-repo variants
+            base = Path(repo_output)
+            repo_output = str(base.parent / f"{base.stem}_{repo_name}{base.suffix}")
+
+        # Build target list: the repo + any extra non-org targets
+        scan_targets = [repo_url] + list(extra_targets)
+
+        try:
+            metadata = scan_manager.start_scan(
+                targets=scan_targets,
+                scan_mode=scan_mode,
+                instruction=instruction,
+                output_file=repo_output,
+                mount_docker=mount_docker,
+            )
+            launched.append({"repo": repo["full_name"], **metadata})
+            console.print(
+                f"  [green]✓[/green] {repo['full_name']} → "
+                f"[dim]scan {metadata['scan_id']}[/dim]"
+            )
+        except Exception as e:
+            console.print(f"  [red]✗[/red] {repo['full_name']}: {e}")
+
+    console.print()
+    console.print(Panel(
+        f"[green bold]Launched {len(launched)}/{total} scans[/green bold]\n\n"
+        f"[dim]Manage scans with:[/dim]\n"
+        f"  [cyan]strix-claude-tui[/cyan]           — TUI dashboard\n"
+        f"  [cyan]screen -list[/cyan]               — list sessions\n"
+        f"  [cyan]screen -x strix-<id>[/cyan]       — attach to scan",
+        title="Org Scan Started",
+    ))
+
+
 def classify_target(target: str) -> dict[str, str]:
-    """Classify a target - must be a GitHub repo URL or local path."""
+    """Classify a target - must be a GitHub repo/org URL or local path."""
     from pathlib import Path
+
+    # Check if it's a GitHub org URL (must check before repo URL)
+    org_name = parse_org_from_url(target)
+    if org_name is not None:
+        return {"type": "github_org", "org": org_name, "url": target.rstrip("/")}
 
     # Check if it's a GitHub SSH URL
     if target.startswith("git@github.com:") or target.startswith("git@"):
@@ -703,9 +821,10 @@ def classify_target(target: str) -> dict[str, str]:
 
     raise click.BadParameter(
         f"Invalid target: {target}\n"
-        "Expected a GitHub URL (https://github.com/user/repo) or local path.\n"
+        "Expected a GitHub URL (https://github.com/user/repo), org URL, or local path.\n"
         "Examples:\n"
         "  https://github.com/user/repo\n"
+        "  https://github.com/orgname       (scan entire org)\n"
         "  git@github.com:user/repo.git\n"
         "  user/repo\n"
         "  ./local-code"
@@ -744,6 +863,7 @@ def main(
         strix-claude-cli -t https://example.com -o ./report.md
         strix-claude-cli -t git@github.com:user/repo.git -m deep
         strix-claude-cli -t https://github.com/user/repo -m deep
+        strix-claude-cli -t https://github.com/orgname -m deep  (scan entire org)
     """
     # Setup logging
     logging.basicConfig(
@@ -767,6 +887,26 @@ def main(
     if instruction_file:
         instruction = Path(instruction_file).read_text()
 
+    # Classify all targets
+    classified_targets = [classify_target(t) for t in targets]
+
+    # Check for org targets — handle them by launching parallel scans
+    org_targets = [ct for ct in classified_targets if ct["type"] == "github_org"]
+    non_org_targets = [t for t, ct in zip(targets, classified_targets) if ct["type"] != "github_org"]
+
+    if org_targets:
+        _handle_org_scan(
+            org_targets=org_targets,
+            extra_targets=non_org_targets,
+            scan_mode=scan_mode,
+            instruction=instruction,
+            output_file=output_file,
+            image=image,
+            mount_docker=mount_docker,
+            verbose=verbose,
+        )
+        return
+
     # Set default output file if not specified (next to where command is run)
     if not output_file:
         from datetime import datetime
@@ -774,9 +914,6 @@ def main(
         output_file = str(Path.cwd() / f"strix_report_{timestamp}.md")
     else:
         output_file = str(Path(output_file).resolve())
-
-    # Classify all targets
-    classified_targets = [classify_target(t) for t in targets]
     local_sources = []
     target_descriptions = []
     github_clone_dir: Path | None = None
