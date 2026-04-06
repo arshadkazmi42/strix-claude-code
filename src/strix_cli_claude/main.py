@@ -675,33 +675,41 @@ def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
 
 
 def classify_target(target: str) -> dict[str, str]:
-    """Classify a target as URL, local path, GitHub repo, domain, or IP."""
+    """Classify a target - must be a GitHub repo URL or local path."""
     from pathlib import Path
 
     # Check if it's a GitHub SSH URL
     if target.startswith("git@github.com:") or target.startswith("git@"):
         return {"type": "github", "url": target}
 
-    # Check if it's a GitHub HTTPS URL (but not a web page)
-    if "github.com" in target and (target.endswith(".git") or "/tree/" not in target and "/blob/" not in target):
+    # Check if it's a GitHub HTTPS URL
+    if "github.com" in target:
         if target.startswith("https://github.com/") or target.startswith("http://github.com/"):
-            # Looks like a repo URL, not a file URL
             parts = target.rstrip('/').split('/')
             if len(parts) >= 5:  # https://github.com/user/repo
                 return {"type": "github", "url": target}
 
-    # Check if it's a local path
+    # Check if it's a local path (for local repos/code)
     if target.startswith("./") or target.startswith("/") or Path(target).exists():
         path = Path(target).resolve()
         if path.exists():
             return {"type": "local", "path": str(path), "name": path.name}
 
-    # Check if it's a URL
-    if target.startswith("http://") or target.startswith("https://"):
-        return {"type": "url", "url": target}
+    # If it looks like a short GitHub reference (user/repo), convert to URL
+    if "/" in target and not target.startswith("http"):
+        parts = target.split("/")
+        if len(parts) == 2 and all(p and not p.startswith(".") for p in parts):
+            return {"type": "github", "url": f"https://github.com/{target}"}
 
-    # Assume it's a domain or IP
-    return {"type": "domain", "domain": target}
+    raise click.BadParameter(
+        f"Invalid target: {target}\n"
+        "Expected a GitHub URL (https://github.com/user/repo) or local path.\n"
+        "Examples:\n"
+        "  https://github.com/user/repo\n"
+        "  git@github.com:user/repo.git\n"
+        "  user/repo\n"
+        "  ./local-code"
+    )
 
 
 @click.command()
