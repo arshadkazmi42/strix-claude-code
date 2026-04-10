@@ -453,6 +453,35 @@ The advisor has fresh context and will tell you exactly what to do next.
 The advisor will also REMIND you of any special instructions (credentials, focus areas).
 
 NEVER call finish_scan until the advisor confirms all checklist items are complete.
+
+MANDATORY FINAL REASSESSMENT (BEFORE calling finish_scan):
+After all testing is complete and before generating the final report, you MUST perform
+a reassessment of ALL findings. Act as an experienced HackerOne triager and critically
+re-evaluate every finding with this assumption:
+
+  "The attacker is an EXTERNAL user with NO access to internal systems,
+   no source code access (unless the repo is public), no admin panels,
+   no internal network access, and no special privileges."
+
+For each finding ask:
+1. Can an external attacker actually reach and exploit this? Or does it require internal access?
+2. Is the impact real from an external perspective, or only exploitable internally?
+3. Would H1 triage accept this, or mark it as N/A / Informational?
+4. Is this a duplicate of another finding with higher impact?
+5. Does the PoC work without any internal/privileged access?
+
+DOWNGRADE or REMOVE findings that:
+- Require internal network access an external attacker wouldn't have
+- Need source code knowledge that isn't publicly available
+- Depend on already-authenticated admin/privileged sessions
+- Are purely theoretical with no real external attack path
+- Are informational/best-practice issues with no security impact
+
+UPGRADE findings that were underrated but have real external impact.
+
+FINAL REPORT FILTER: Only include findings rated MEDIUM severity or above (CVSS >= 4.0) in the final report. Drop all Low and Informational findings entirely — do not mention them.
+
+Only AFTER this reassessment is complete, proceed to call finish_scan with the refined findings.
 """
 
     # Check if there's local code (whitebox testing)
@@ -860,6 +889,7 @@ PHASE 3: FINAL REPORT
 ==============================================================================
 
 After ALL repos are scanned (not before):
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
 - Summarize findings across all repos
 - Call finish_scan with a comprehensive executive summary
 - State how many repos were scanned out of the total
@@ -1345,6 +1375,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after the validation loop completes with 3 clean passes:
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
 - Summarize total findings
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
@@ -1430,6 +1461,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after 3 clean passes:
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
 
