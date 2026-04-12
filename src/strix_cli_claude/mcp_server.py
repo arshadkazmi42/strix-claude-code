@@ -528,6 +528,36 @@ ONLY call this when you are completely done with the assessment.""",
             "required": ["executive_summary", "methodology", "technical_analysis", "recommendations"],
         },
     ),
+    Tool(
+        name="fetch_github_org_repos",
+        description="""Fetch all scannable repositories from a GitHub organization.
+
+Returns a filtered list of repos (skips archived, disabled, forked, demo/example/sample/test repos, and repos exceeding max_size_kb).
+Each repo includes: name, full_name, clone_url, html_url, stars, language, description, default_branch, size_kb.
+
+Use this tool when scanning a GitHub org to get the list of repos to clone and scan.
+After getting the list, clone repos inside the sandbox using terminal_execute with git clone.""",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "org": {
+                    "type": "string",
+                    "description": "GitHub organization name (e.g. 'facebook', 'google')",
+                },
+                "include_private": {
+                    "type": "boolean",
+                    "description": "Include private repos (requires token with appropriate scope)",
+                    "default": False,
+                },
+                "max_size_kb": {
+                    "type": "integer",
+                    "description": "Maximum repo size in KB. Repos larger than this are skipped. Default: 2097152 (2 GB)",
+                    "default": 2097152,
+                },
+            },
+            "required": ["org"],
+        },
+    ),
 ]
 
 
@@ -566,6 +596,9 @@ def create_server() -> Server:
 
         if name == "read_report":
             return await handle_read_report()
+
+        if name == "fetch_github_org_repos":
+            return await handle_fetch_github_org_repos(arguments)
 
         if not TOOL_SERVER_URL or not TOOL_SERVER_TOKEN:
             return [TextContent(
@@ -995,6 +1028,36 @@ def create_server() -> Server:
             output += f"- [{note['id']}] **{note['title']}** ({note['category']})\n  {note['content'][:100]}{'...' if len(note['content']) > 100 else ''}\n\n"
 
         return [TextContent(type="text", text=output)]
+
+    async def handle_fetch_github_org_repos(arguments: dict[str, Any]) -> list[TextContent]:
+        """Handle fetch_github_org_repos - fetches repos from GitHub org via API."""
+        org = arguments.get("org", "").strip()
+        include_private = arguments.get("include_private", False)
+        max_size_kb = arguments.get("max_size_kb", 2097152)
+
+        if not org:
+            return [TextContent(type="text", text="Error: org parameter is required")]
+
+        try:
+            from .github_org import fetch_org_repos
+            repos = fetch_org_repos(org, include_private=include_private, max_size_kb=max_size_kb)
+
+            if not repos:
+                return [TextContent(type="text", text=f"No repos found for org '{org}' after filtering.")]
+
+            # Format as JSON for Claude to parse
+            output = json.dumps({
+                "org": org,
+                "total_repos": len(repos),
+                "repos": repos,
+            }, indent=2)
+
+            return [TextContent(type="text", text=output)]
+
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error fetching repos: {e}")]
 
     return server
 

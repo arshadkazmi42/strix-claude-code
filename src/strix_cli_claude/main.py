@@ -16,10 +16,28 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from .github_org import parse_org_from_url
 from .sandbox import Sandbox, SandboxError
 
 console = Console()
 logger = logging.getLogger(__name__)
+
+# Path to the strix guidelines file (CLAUDE.md)
+_STRIX_GUIDELINES_PATH = Path(__file__).parent.parent.parent / ".claude" / "CLAUDE.md"
+
+
+def _load_strix_guidelines() -> str | None:
+    """Load Strix triage guidelines from .claude/CLAUDE.md.
+
+    Searches for the file relative to the package root so it works
+    regardless of the working directory Claude is launched from.
+    """
+    if _STRIX_GUIDELINES_PATH.is_file():
+        try:
+            return _STRIX_GUIDELINES_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            logger.warning("Failed to read Strix guidelines from %s", _STRIX_GUIDELINES_PATH)
+    return None
 
 
 def get_system_prompt(targets: str, scan_mode: str, cpu_count: int, instruction: str | None = None, report_file: str | None = None, mount_docker: bool = False) -> str:
@@ -435,6 +453,35 @@ The advisor has fresh context and will tell you exactly what to do next.
 The advisor will also REMIND you of any special instructions (credentials, focus areas).
 
 NEVER call finish_scan until the advisor confirms all checklist items are complete.
+
+MANDATORY FINAL REASSESSMENT (BEFORE calling finish_scan):
+After all testing is complete and before generating the final report, you MUST perform
+a reassessment of ALL findings. Act as an experienced HackerOne triager and critically
+re-evaluate every finding with this assumption:
+
+  "The attacker is an EXTERNAL user with NO access to internal systems,
+   no source code access (unless the repo is public), no admin panels,
+   no internal network access, and no special privileges."
+
+For each finding ask:
+1. Can an external attacker actually reach and exploit this? Or does it require internal access?
+2. Is the impact real from an external perspective, or only exploitable internally?
+3. Would H1 triage accept this, or mark it as N/A / Informational?
+4. Is this a duplicate of another finding with higher impact?
+5. Does the PoC work without any internal/privileged access?
+
+DOWNGRADE or REMOVE findings that:
+- Require internal network access an external attacker wouldn't have
+- Need source code knowledge that isn't publicly available
+- Depend on already-authenticated admin/privileged sessions
+- Are purely theoretical with no real external attack path
+- Are informational/best-practice issues with no security impact
+
+UPGRADE findings that were underrated but have real external impact.
+
+FINAL REPORT FILTER: Only include findings rated MEDIUM severity or above (CVSS >= 4.0) in the final report. Drop all Low and Informational findings entirely — do not mention them.
+
+Only AFTER this reassessment is complete, proceed to call finish_scan with the refined findings.
 """
 
     # Check if there's local code (whitebox testing)
@@ -610,6 +657,18 @@ Remember: A single high-impact vulnerability is worth more than dozens of low-se
 Focus on demonstrable business impact. Document everything with create_vulnerability_report.
 """
 
+    # Load triage guidelines from CLAUDE.md if available
+    claude_md = _load_strix_guidelines()
+    if claude_md:
+        base_prompt += f"""
+==============================================================================
+STRIX TRIAGE & REPORTING GUIDELINES (MANDATORY)
+==============================================================================
+Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the user.
+
+{claude_md}
+"""
+
     return base_prompt
 
 
@@ -674,9 +733,229 @@ def clone_github_repo(repo_url: str, target_dir: Path) -> Path:
     return clone_path
 
 
+MAX_PARALLEL_AGENTS = 8
+
+
+def _handle_org_scan(
+    org_targets: list[dict[str, str]],
+    extra_targets: list[str],
+    scan_mode: str,
+    instruction: str | None,
+    output_file: str | None,
+    image: str | None,
+    mount_docker: bool,
+    verbose: bool,
+) -> None:
+    """Launch a single Strix sandbox that scans all repos in the org.
+
+    Claude inside the sandbox uses the fetch_github_org_repos MCP tool to
+    list repos, clones them via terminal_execute, and runs up to
+    MAX_PARALLEL_AGENTS parallel agents for scanning.
+    """
+    from datetime import datetime
+
+    org_names = [ot["org"] for ot in org_targets]
+
+    console.print(Panel(
+        f"[bold]Org scan:[/bold] [cyan]{', '.join(org_names)}[/cyan]\n"
+        f"[dim]Claude will fetch repos, clone them inside the sandbox, and scan with up to {MAX_PARALLEL_AGENTS} parallel agents[/dim]",
+        title="Org Scan",
+    ))
+
+    # Build target descriptions for the system prompt
+    target_descriptions = [f"GitHub org: {name}" for name in org_names]
+    for et in extra_targets:
+        target_descriptions.append(et)
+
+    # Set output file
+    if not output_file:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        org_label = "_".join(org_names)
+        output_file = str(Path.cwd() / f"strix_report_{org_label}_{timestamp}.md")
+    else:
+        output_file = str(Path(output_file).resolve())
+
+    # Generate scan_id
+    import secrets
+    scan_id = secrets.token_hex(4)
+
+    # Start a single sandbox
+    sandbox: Sandbox | None = None
+    temp_config_dir: str | None = None
+
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Starting Docker sandbox...", total=None)
+            sandbox = Sandbox(image=image, scan_id=scan_id, mount_docker_socket=mount_docker)
+            atexit.register(sandbox.stop)
+            sandbox_info = sandbox.start()
+            progress.update(task, description="Sandbox started!")
+
+        console.print(f"[green]Sandbox ready![/green]")
+        console.print(f"  Container: {sandbox_info['container_name']}")
+        console.print(f"  Tool server: {sandbox_info['tool_server_url']}")
+        console.print(f"  CPUs allocated: {sandbox_info['cpu_count']}")
+
+        # Create MCP config
+        mcp_config = create_mcp_config(
+            sandbox_info["tool_server_url"],
+            sandbox_info["tool_server_token"],
+            sandbox_info["scan_id"],
+            output_file,
+        )
+
+        temp_config_dir = tempfile.mkdtemp(prefix=f"strix-cli-{scan_id}")
+        mcp_config_path = Path(temp_config_dir) / "mcp.json"
+        mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
+
+        # Write tool server credentials for parallel subagents
+        creds_file = Path("/tmp/strix-tool-server.env")
+        creds_file.write_text(f"""STRIX_TOOL_URL={sandbox_info["tool_server_url"]}
+STRIX_TOOL_TOKEN={sandbox_info["tool_server_token"]}
+""")
+        creds_file.chmod(0o600)
+
+        # Create helper script for subagents
+        helper_script = Path("/tmp/strix-tool")
+        helper_script.write_text(f'''#!/bin/bash
+TOOL_NAME="$1"
+TOOL_ARGS="$2"
+curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
+  -H "Authorization: Bearer {sandbox_info["tool_server_token"]}" \\
+  -H "Content-Type: application/json" \\
+  -d "{{\\"tool_name\\": \\"$TOOL_NAME\\", \\"kwargs\\": $TOOL_ARGS, \\"agent_id\\": \\"subagent\\"}}" \\
+  | jq -r '.result.content // .result // .error // "No output"'
+''')
+        helper_script.chmod(0o755)
+
+        # Generate system prompt
+        target_info = "\n".join(target_descriptions)
+        system_prompt = get_system_prompt(target_info, scan_mode, sandbox_info["cpu_count"], instruction, output_file, mount_docker)
+
+        # Write system prompt to file
+        system_prompt_path = Path(temp_config_dir) / "system_prompt.txt"
+        system_prompt_path.write_text(system_prompt)
+
+        org_list_str = ", ".join(org_names)
+        initial_prompt = f"""YOU ARE SCANNING GITHUB ORGANIZATION(S): {org_list_str}
+
+==============================================================================
+CRITICAL RULE: SCAN ALL REPOSITORIES. SKIP NONE.
+==============================================================================
+
+The ONLY repos that are pre-filtered out are: archived, disabled, forked, demo,
+example, sample, test, template, tutorial, starter, boilerplate, empty, and
+oversized (>2 GB). These are already removed by fetch_github_org_repos.
+
+Every repo returned by fetch_github_org_repos MUST be scanned. Do NOT skip any
+repo for any reason (too many repos, looks uninteresting, low stars, etc.).
+You must scan ALL of them.
+
+==============================================================================
+PHASE 1: FETCH AND CLONE ALL REPOS (MANDATORY FIRST STEP)
+==============================================================================
+
+STEP 1 — Use the fetch_github_org_repos tool for each org to get the repo list.
+  Orgs to fetch: {org_list_str}
+
+STEP 2 — Clone ALL repos inside the sandbox using terminal_execute:
+  For each repo, run: git clone --depth 1 <clone_url> /workspace/<repo_name>
+
+STEP 3 — Confirm all repos are cloned. List /workspace to verify.
+
+==============================================================================
+PHASE 2: SCAN IN BATCHES OF 10
+==============================================================================
+
+Process repos in batches of 10. For each batch:
+1. Spawn up to {MAX_PARALLEL_AGENTS} parallel agents (max {MAX_PARALLEL_AGENTS} active at a time)
+2. Each agent scans ONE repo:
+   - Read the codebase structure (list_files /workspace/<repo>)
+   - Check .github/workflows/ for GitHub Actions vulnerabilities
+   - Pattern scan for secrets, injection sinks, auth issues
+   - For security-critical repos (auth, crypto, CI/CD): do actual code review
+   - Report findings with create_vulnerability_report
+3. Wait for ALL agents in the batch to finish
+4. Move to the next batch of 10
+
+Repeat until EVERY repo has been scanned. Do NOT stop early.
+
+==============================================================================
+PHASE 3: FINAL REPORT
+==============================================================================
+
+After ALL repos are scanned (not before):
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
+- Summarize findings across all repos
+- Call finish_scan with a comprehensive executive summary
+- State how many repos were scanned out of the total
+
+==============================================================================
+
+START PHASE 1 NOW. Fetch the repos first.
+"""
+
+        console.print("\n[bold]Starting Claude CLI for org scan...[/bold]\n")
+        console.print("=" * 60)
+
+        claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
+        claude_base_args = [
+            "claude",
+            "--mcp-config", str(mcp_config_path),
+            "--append-system-prompt", system_prompt,
+            "--permission-mode", "bypassPermissions",
+            "--dangerously-skip-permissions",
+        ]
+
+        if sys.stdin.isatty():
+            result = subprocess.run(
+                claude_base_args + [initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
+        else:
+            console.print(f"\n[bold yellow]No interactive terminal - running in print mode.[/bold yellow]")
+            result = subprocess.run(
+                claude_base_args + ["--print", initial_prompt],
+                cwd=temp_config_dir,
+                env=claude_env,
+            )
+
+        console.print("\n" + "=" * 60)
+        console.print("[bold]Org scan session ended.[/bold]")
+
+    except SandboxError as e:
+        console.print(f"[red]Sandbox error:[/red] {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        if verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if temp_config_dir and Path(temp_config_dir).exists():
+            shutil.rmtree(temp_config_dir, ignore_errors=True)
+        if sandbox:
+            with console.status("Stopping sandbox..."):
+                sandbox.stop()
+            console.print("[green]Sandbox stopped.[/green]")
+
+
 def classify_target(target: str) -> dict[str, str]:
-    """Classify a target - must be a GitHub repo URL or local path."""
+    """Classify a target - must be a GitHub repo/org URL or local path."""
     from pathlib import Path
+
+    # Check if it's a GitHub org URL (must check before repo URL)
+    org_name = parse_org_from_url(target)
+    if org_name is not None:
+        return {"type": "github_org", "org": org_name, "url": target.rstrip("/")}
 
     # Check if it's a GitHub SSH URL
     if target.startswith("git@github.com:") or target.startswith("git@"):
@@ -703,9 +982,10 @@ def classify_target(target: str) -> dict[str, str]:
 
     raise click.BadParameter(
         f"Invalid target: {target}\n"
-        "Expected a GitHub URL (https://github.com/user/repo) or local path.\n"
+        "Expected a GitHub URL (https://github.com/user/repo), org URL, or local path.\n"
         "Examples:\n"
         "  https://github.com/user/repo\n"
+        "  https://github.com/orgname       (scan entire org)\n"
         "  git@github.com:user/repo.git\n"
         "  user/repo\n"
         "  ./local-code"
@@ -744,6 +1024,7 @@ def main(
         strix-claude-cli -t https://example.com -o ./report.md
         strix-claude-cli -t git@github.com:user/repo.git -m deep
         strix-claude-cli -t https://github.com/user/repo -m deep
+        strix-claude-cli -t https://github.com/orgname -m deep  (scan entire org)
     """
     # Setup logging
     logging.basicConfig(
@@ -767,6 +1048,26 @@ def main(
     if instruction_file:
         instruction = Path(instruction_file).read_text()
 
+    # Classify all targets
+    classified_targets = [classify_target(t) for t in targets]
+
+    # Check for org targets — handle them by launching parallel scans
+    org_targets = [ct for ct in classified_targets if ct["type"] == "github_org"]
+    non_org_targets = [t for t, ct in zip(targets, classified_targets) if ct["type"] != "github_org"]
+
+    if org_targets:
+        _handle_org_scan(
+            org_targets=org_targets,
+            extra_targets=non_org_targets,
+            scan_mode=scan_mode,
+            instruction=instruction,
+            output_file=output_file,
+            image=image,
+            mount_docker=mount_docker,
+            verbose=verbose,
+        )
+        return
+
     # Set default output file if not specified (next to where command is run)
     if not output_file:
         from datetime import datetime
@@ -774,9 +1075,6 @@ def main(
         output_file = str(Path.cwd() / f"strix_report_{timestamp}.md")
     else:
         output_file = str(Path(output_file).resolve())
-
-    # Classify all targets
-    classified_targets = [classify_target(t) for t in targets]
     local_sources = []
     target_descriptions = []
     github_clone_dir: Path | None = None
@@ -1077,6 +1375,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after the validation loop completes with 3 clean passes:
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
 - Summarize total findings
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
@@ -1162,6 +1461,7 @@ PHASE 5: FINAL REPORT
 ==============================================================================
 
 Only after 3 clean passes:
+- REASSESS all findings as an H1 triager: assume the attacker is an external user with NO access to internal systems. Downgrade or remove findings that require internal access, privileged sessions, or have no real external attack path. Upgrade underrated findings with real external impact. Only include MEDIUM+ severity findings (CVSS >= 4.0) in the final report — drop all Low/Informational.
 - Call finish_scan with comprehensive executive summary
 - State: "Completed [X] validation passes. Final 3 passes found 0 new issues."
 

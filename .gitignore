@@ -48,3 +48,6 @@ htmlcov/
 *.env
 secrets.json
 credentials.json
+
+.claude/settings.local.json
+strix_report_*
