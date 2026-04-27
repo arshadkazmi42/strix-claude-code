@@ -93,6 +93,7 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true", help="Print the command without executing")
     p.add_argument("--limit", type=int, help="Limit number of repos (useful for testing)")
     p.add_argument("--cli", default="strix-claude-cli", help="Path to strix-claude-cli binary (default: strix-claude-cli)")
+    p.add_argument("--instruction", help="Custom instructions passed through to strix-claude-cli")
     args = p.parse_args()
 
     org = parse_org(args.org)
@@ -115,6 +116,8 @@ def main() -> int:
         print(f"  - {repo['full_name']}")
 
     cmd = [args.cli, *targets, "-m", args.mode]
+    if args.instruction:
+        cmd.extend(["--instruction", args.instruction])
 
     if args.dry_run:
         print("\nWould run:")
