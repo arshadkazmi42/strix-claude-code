@@ -905,6 +905,7 @@ START PHASE 1 NOW. Fetch the repos first.
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
             "claude",
+            "--model", "claude-opus-4-7",
             "--mcp-config", str(mcp_config_path),
             "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
@@ -949,7 +950,7 @@ START PHASE 1 NOW. Fetch the repos first.
 
 
 def classify_target(target: str) -> dict[str, str]:
-    """Classify a target - must be a GitHub repo/org URL or local path."""
+    """Classify a target as GitHub repo/org, local path, URL, domain, or IP."""
     from pathlib import Path
 
     # Check if it's a GitHub org URL (must check before repo URL)
@@ -980,16 +981,12 @@ def classify_target(target: str) -> dict[str, str]:
         if len(parts) == 2 and all(p and not p.startswith(".") for p in parts):
             return {"type": "github", "url": f"https://github.com/{target}"}
 
-    raise click.BadParameter(
-        f"Invalid target: {target}\n"
-        "Expected a GitHub URL (https://github.com/user/repo), org URL, or local path.\n"
-        "Examples:\n"
-        "  https://github.com/user/repo\n"
-        "  https://github.com/orgname       (scan entire org)\n"
-        "  git@github.com:user/repo.git\n"
-        "  user/repo\n"
-        "  ./local-code"
-    )
+    # Check if it's a URL
+    if target.startswith("http://") or target.startswith("https://"):
+        return {"type": "url", "url": target}
+
+    # Assume it's a domain or IP
+    return {"type": "domain", "domain": target}
 
 
 @click.command()
@@ -1224,6 +1221,7 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
         wrapper_script.write_text(f'''#!/bin/bash
 export CLAUDE_CODE_SKIP_TRUST_DIALOG=1
 exec claude \\
+    --model claude-opus-4-7 \\
     --mcp-config "{mcp_config_path}" \\
     --append-system-prompt "$(cat "{system_prompt_path}")" \\
     --permission-mode bypassPermissions \\
@@ -1474,6 +1472,7 @@ START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
             "claude",
+            "--model", "claude-opus-4-7",
             "--mcp-config", str(mcp_config_path),
             "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
