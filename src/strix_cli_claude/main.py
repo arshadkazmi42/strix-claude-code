@@ -16,8 +16,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from .extension_downloader import parse_extension_url
 from .github_org import parse_org_from_url
 from .sandbox import Sandbox, SandboxError
+from .validator import run_validation_pass
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -745,6 +747,7 @@ def _handle_org_scan(
     image: str | None,
     mount_docker: bool,
     verbose: bool,
+    validate: bool = True,
 ) -> None:
     """Launch a single Strix sandbox that scans all repos in the org.
 
@@ -929,6 +932,26 @@ START PHASE 1 NOW. Fetch the repos first.
         console.print("\n" + "=" * 60)
         console.print("[bold]Org scan session ended.[/bold]")
 
+        if validate:
+            try:
+                log_dir = Path(output_file).parent / f"strix_validator_logs_{scan_id}"
+                run_validation_pass(
+                    report_file=output_file,
+                    mcp_config_path=mcp_config_path,
+                    target_info=target_info,
+                    scan_mode=scan_mode,
+                    cpu_count=sandbox_info["cpu_count"],
+                    log_dir=log_dir,
+                    console=console,
+                )
+            except Exception as e:
+                console.print(f"[red]Validator pass failed:[/red] {e}")
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
+        else:
+            console.print("[dim]Validator pass skipped (--no-validate).[/dim]")
+
     except SandboxError as e:
         console.print(f"[red]Sandbox error:[/red] {e}")
         sys.exit(1)
@@ -981,6 +1004,11 @@ def classify_target(target: str) -> dict[str, str]:
         if len(parts) == 2 and all(p and not p.startswith(".") for p in parts):
             return {"type": "github", "url": f"https://github.com/{target}"}
 
+    # Check if it's a VS Code Marketplace or Chrome Web Store URL
+    ext_info = parse_extension_url(target)
+    if ext_info is not None:
+        return {"type": "extension", **ext_info}
+
     # Check if it's a URL
     if target.startswith("http://") or target.startswith("https://"):
         return {"type": "url", "url": target}
@@ -999,6 +1027,7 @@ def classify_target(target: str) -> dict[str, str]:
 @click.option("--mount-docker", is_flag=True, help="Mount Docker socket for container scanning (trivy, docker inspect, etc.)")
 @click.option("--keep-container", is_flag=True, help="Keep container running after scan")
 @click.option("--scan-id", help="Scan ID (used by TUI for tracking)")
+@click.option("--no-validate", is_flag=True, help="Skip the post-scan validator pass that re-checks each finding with a fresh agent")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def main(
     targets: tuple[str, ...],
@@ -1010,6 +1039,7 @@ def main(
     mount_docker: bool,
     keep_container: bool,
     scan_id: str | None,
+    no_validate: bool,
     verbose: bool,
 ):
     """Strix Claude Code - AI-powered penetration testing using Claude CLI.
@@ -1062,6 +1092,7 @@ def main(
             image=image,
             mount_docker=mount_docker,
             verbose=verbose,
+            validate=not no_validate,
         )
         return
 
@@ -1116,6 +1147,17 @@ def main(
                     })
                     target_descriptions.append(f"GitHub repo: /workspace/{clone_path.name}")
                     break
+        elif ct["type"] == "extension":
+            if ct["kind"] == "vscode":
+                target_descriptions.append(
+                    f"VS Code extension '{ct['publisher']}.{ct['extension']}' "
+                    f"(call download_extension with url={ct['url']!r} to fetch source into /workspace)"
+                )
+            else:
+                target_descriptions.append(
+                    f"Chrome extension '{ct['ext_id']}' "
+                    f"(call download_extension with url={ct['url']!r} to fetch source into /workspace)"
+                )
         elif ct["type"] == "url":
             target_descriptions.append(f"URL: {ct['url']}")
         else:
@@ -1213,7 +1255,7 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
         wrapper_script = Path(temp_config_dir) / "run_claude.sh"
 
         # Determine wrapper prompt based on test type
-        if any(ct["type"] == "local" for ct in classified_targets):
+        if any(ct["type"] in ("local", "extension") for ct in classified_targets):
             wrapper_initial = "START THE WHITEBOX SECURITY ASSESSMENT NOW. First, use list_files to enumerate the ENTIRE codebase. Then read and understand EVERY source file before testing. Do NOT run generic scanners - understand the code first."
         else:
             wrapper_initial = "START THE SECURITY ASSESSMENT NOW. Execute all phases automatically: reconnaissance, vulnerability testing, and reporting. Do NOT wait for user input. BEGIN IMMEDIATELY."
@@ -1232,7 +1274,7 @@ exec claude \\
 
         # Initial prompt to start the scan automatically
         # Check if we have local code targets for whitebox testing
-        has_local_code = any(ct["type"] == "local" for ct in classified_targets)
+        has_local_code = any(ct["type"] in ("local", "extension") for ct in classified_targets)
 
         if has_local_code:
             # Whitebox testing - component discovery first
@@ -1468,6 +1510,23 @@ Only after 3 clean passes:
 START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
 """
 
+        # If any extension targets are present, prepend a short framing line
+        # telling the agent to use the download_extension MCP tool to fetch
+        # the source into /workspace, then run the whitebox review against
+        # the extracted directory.
+        extension_targets_present = [ct for ct in classified_targets if ct["type"] == "extension"]
+        if extension_targets_present:
+            ext_lines = [f"  - {ct['url']}" for ct in extension_targets_present]
+            ext_summary = "\n".join(ext_lines)
+            extension_preamble = f"""TASK: download and security-review the listed browser/IDE extension(s):
+
+{ext_summary}
+
+For each URL above, call the `download_extension` MCP tool with that URL — it will fetch the public package (.vsix / .crx) into the sandbox and extract the source under /workspace/<auto-name>. Then list_files on the extracted directory and run the whitebox source-code review against it.
+
+"""
+            initial_prompt = extension_preamble + initial_prompt
+
         # Common claude args
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
@@ -1498,6 +1557,26 @@ START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
 
         console.print("\n" + "=" * 60)
         console.print("[bold]Scan session ended.[/bold]")
+
+        if not no_validate:
+            try:
+                log_dir = Path(output_file).parent / f"strix_validator_logs_{scan_id}"
+                run_validation_pass(
+                    report_file=output_file,
+                    mcp_config_path=mcp_config_path,
+                    target_info=target_info,
+                    scan_mode=scan_mode,
+                    cpu_count=sandbox_info["cpu_count"],
+                    log_dir=log_dir,
+                    console=console,
+                )
+            except Exception as e:
+                console.print(f"[red]Validator pass failed:[/red] {e}")
+                if verbose:
+                    import traceback
+                    traceback.print_exc()
+        else:
+            console.print("[dim]Validator pass skipped (--no-validate).[/dim]")
 
         if keep_container:
             console.print(f"\n[yellow]Container kept running:[/yellow] {sandbox_info['container_name']}")
