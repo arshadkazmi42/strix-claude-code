@@ -894,6 +894,25 @@ Process repos in batches of 10. For each batch:
 2. Each agent scans ONE repo:
    - Read the codebase structure (list_files /workspace/<repo>)
    - Check .github/workflows/ for GitHub Actions vulnerabilities
+   - Pull issue/PR intel from the GitHub API (MANDATORY — one of the highest-yield
+     sources of vulnerability leads: abandoned fixes, dismissed-but-real bugs,
+     partially-patched issues, CVE refs that never made the CHANGELOG):
+       * Auth: AUTH=(); [ -n "$GITHUB_TOKEN" ] && AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
+       * Open + closed issues:  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/issues?state=all&per_page=100"  (paginate via Link header)
+       * Open + closed PRs:     curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/pulls?state=all&per_page=100"   (paginate)
+       * Security advisories:   curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/security-advisories"
+       * Filter titles/bodies for: security, vuln, CVE, RCE, XSS, SSRF, SQLi,
+         injection, bypass, leak, prototype pollution, deserialization, auth,
+         race, TOCTOU, DoS, panic, crash, sanitiz, escape, traversal, hardcoded
+       * For every hit, also fetch /issues/<n>/comments and /pulls/<n>/comments
+         and read the full thread
+       * Triage rules:
+           - Open issues with security signal → unpatched. Reproduce against the cloned HEAD.
+           - Closed "won't fix" / "by design" / dismissed → often real bugs the maintainer ignored. Verify against current HEAD.
+           - Closed-unmerged PRs = abandoned fixes → the bug almost certainly still exists. HIGH priority — confirm and report.
+           - Open PRs with security fixes → read the diff; the bug is real. Attack the same sink from a different angle the patch does not cover.
+           - Closed-merged security PRs → check for incomplete fixes (multi-sink bugs where only one sink got patched).
+           - Advisories listing versions that are still in HEAD → patch is missing in this branch.
    - Pattern scan for secrets, injection sinks, auth issues
    - For security-critical repos (auth, crypto, CI/CD): do actual code review
    - Report findings with create_vulnerability_report
@@ -1516,6 +1535,44 @@ Only after 3 clean passes:
 
 START PHASE 1 NOW. Be THOROUGH. Miss NOTHING.
 """
+
+        # If any GitHub-origin targets are present, prepend an intel-gathering
+        # preamble telling the agent to pull open/closed issues and PRs from
+        # the GitHub API before reading code. The issue/PR history is one of
+        # the highest-yield vulnerability sources for OSS repos.
+        github_targets_present = [ct for ct in classified_targets if ct["type"] == "github"]
+        if github_targets_present:
+            gh_url_lines = "\n".join(f"  - {gt['url']}" for gt in github_targets_present)
+            github_intel_preamble = f"""GITHUB ISSUE / PR INTEL (MANDATORY — BEFORE ANY OTHER PHASE):
+GitHub repos in scope:
+{gh_url_lines}
+
+The issue and PR history is one of the highest-yield vulnerability sources for an OSS repo (abandoned fixes, dismissed-but-real bug reports, partially-patched issues, CVE refs that never made the CHANGELOG, maintainer hand-waves of real bugs). Mine it BEFORE reading code.
+
+For each repo above, derive <owner>/<repo> from the URL and pull:
+  AUTH=(); [ -n "$GITHUB_TOKEN" ] && AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/issues?state=all&per_page=100"   # paginate via Link header
+  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/pulls?state=all&per_page=100"    # paginate
+  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/security-advisories"
+  # For any item with security signal, also pull the full thread:
+  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/issues/<n>/comments"
+  curl -s "${{AUTH[@]}}" "https://api.github.com/repos/<owner>/<repo>/pulls/<n>/comments"
+
+Filter titles, bodies, and comments for: security, vuln, CVE, RCE, XSS, SSRF, SQLi, injection, bypass, leak, prototype pollution, deserialization, auth, race, TOCTOU, DoS, panic, crash, sanitiz, escape, traversal, hardcoded.
+
+Triage rules for every hit:
+- Open issue with security signal → unpatched. Reproduce against the cloned HEAD.
+- Closed "won't fix" / "by design" / dismissed → frequently real bugs the maintainer ignored. Verify against current HEAD before accepting the dismissal.
+- Closed-unmerged PR (abandoned fix) → the bug almost certainly still exists in HEAD. HIGH priority — confirm and report.
+- Open PR proposing a security fix → the bug is real. Read the diff to identify the sink, then attack it from a different angle the patch does not cover.
+- Closed-merged security PR → look for incomplete fixes (multi-sink bugs where only one sink got patched, or filter-style fixes you can bypass).
+- Security advisories listing versions that are still in the current branch → patch missing in HEAD.
+
+Output a TODO list of suspected vulnerabilities derived from the intel, with the issue/PR number and the file(s) in /workspace to verify against, BEFORE proceeding to the phases below.
+
+==============================================================================
+"""
+            initial_prompt = github_intel_preamble + initial_prompt
 
         # If any extension targets are present, prepend a short framing line
         # telling the agent to use the download_extension MCP tool to fetch
