@@ -986,9 +986,47 @@ START PHASE 1 NOW. Fetch the repos first.
             console.print("[green]Sandbox stopped.[/green]")
 
 
-def _handle_h1_scan(
-    h1_programs: list[str],
-    h1_asset_types: list[str],
+def _bounty_state_block(platform: str | None) -> str:
+    """Snapshot the DB once at session start for the initial prompt.
+
+    Imports are lazy so the CLI still loads if the package layout shifts.
+    """
+    try:
+        from strix_cli_claude import db as _bdb
+        _bdb.init_db()
+        h1_status = _bdb.scan_status_counts(source="h1")
+        it_status = _bdb.scan_status_counts(source="intigriti")
+        h1_programs_n = len(_bdb.list_programs(source="h1"))
+        it_programs_n = len(_bdb.list_programs(source="intigriti"))
+        f_confirmed = len(_bdb.list_findings(status="confirmed"))
+        f_candidate = len(_bdb.list_findings(status="candidate"))
+        f_rejected = len(_bdb.list_findings(status="rejected"))
+    except Exception as e:
+        return f"  (could not read DB: {type(e).__name__}: {e})"
+
+    def _line(name: str, n_prog: int, s: dict) -> str:
+        return (
+            f"    {name:<10} {n_prog:>5} programs, "
+            f"{s.get('pending', 0):>6} pending, "
+            f"{s.get('in_progress', 0):>3} in-progress, "
+            f"{s.get('done', 0):>5} done, "
+            f"{s.get('skipped', 0):>5} skipped"
+        )
+
+    lines = [
+        _line("h1:", h1_programs_n, h1_status),
+        _line("intigriti:", it_programs_n, it_status),
+        f"    findings:  {f_confirmed} confirmed | {f_candidate} candidate | {f_rejected} rejected",
+    ]
+    if platform:
+        lines.append(f"    session platform filter: {platform}")
+    return "\n".join(lines)
+
+
+def _handle_bounty_session(
+    platform: str | None,
+    bounty_programs: list[str],
+    bounty_asset_types: list[str],
     scan_mode: str,
     instruction: str | None,
     output_file: str | None,
@@ -997,39 +1035,39 @@ def _handle_h1_scan(
     keep_container: bool,
     verbose: bool,
 ) -> None:
-    """Run Strix in HackerOne work-queue mode.
+    """Run Strix in bounty work-queue mode.
 
-    No target is supplied on the CLI — Claude pulls programs/scopes from the
-    HackerOne API into ~/.strix/strix.db, then loops:
-        scan_claim_next → set up → scan → finding_create → validator
-        → finding_confirm/reject → scan_mark_done → repeat.
+    No -t target is supplied — Claude has the H1 and Intigriti MCP tools
+    plus a SQLite ledger at ~/.strix/strix.db. No sync runs automatically;
+    the user drives sync/inspect/work via natural language in the chat.
     """
     from datetime import datetime
     import secrets
 
     if not output_file:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_file = str(Path.cwd() / f"strix_h1_{timestamp}.md")
+        platform_tag = f"_{platform}" if platform else ""
+        output_file = str(Path.cwd() / f"strix_bounty{platform_tag}_{timestamp}.md")
     else:
         output_file = str(Path(output_file).resolve())
 
     scan_id = secrets.token_hex(4)
 
+    state_block = _bounty_state_block(platform)
+
     filter_summary_lines: list[str] = []
-    if h1_programs:
-        filter_summary_lines.append(f"Programs: {', '.join(h1_programs)}")
-    else:
-        filter_summary_lines.append("Programs: (any — will ask)")
-    if h1_asset_types:
-        filter_summary_lines.append(f"Asset types: {', '.join(h1_asset_types)}")
-    else:
-        filter_summary_lines.append("Asset types: (any — will ask)")
+    filter_summary_lines.append(f"Platform: {platform or '(any)'}")
+    filter_summary_lines.append(f"Programs: {', '.join(bounty_programs) if bounty_programs else '(any)'}")
+    filter_summary_lines.append(f"Asset types: {', '.join(bounty_asset_types) if bounty_asset_types else '(any)'}")
 
     console.print(Panel(
-        "[bold]HackerOne work-queue mode[/bold]\n"
+        "[bold]Bounty work-queue mode[/bold]\n"
         + "\n".join(filter_summary_lines)
-        + f"\n[dim]DB: ~/.strix/strix.db   Output: {output_file}[/dim]",
-        title="Strix Claude Code — H1 Mode",
+        + "\n\n[bold]DB state:[/bold]\n"
+        + state_block
+        + f"\n\n[dim]DB: ~/.strix/strix.db   Output: {output_file}[/dim]\n"
+        + "[dim]No sync runs on entry. Type 'sync h1' or 'sync intigriti' in chat to refresh.[/dim]",
+        title="Strix Claude Code — Bounty Mode",
     ))
 
     sandbox: Sandbox | None = None
@@ -1060,152 +1098,122 @@ def _handle_h1_scan(
             output_file,
         )
 
-        temp_config_dir = tempfile.mkdtemp(prefix=f"strix-h1-{scan_id}")
+        temp_config_dir = tempfile.mkdtemp(prefix=f"strix-bounty-{scan_id}")
         mcp_config_path = Path(temp_config_dir) / "mcp.json"
         mcp_config_path.write_text(json.dumps(mcp_config, indent=2))
 
-        target_info = "HackerOne queue (programs/assets resolved at runtime via MCP)"
+        target_info = "Bounty queue (programs/assets resolved at runtime via MCP from ~/.strix/strix.db)"
         system_prompt = get_system_prompt(
             target_info, scan_mode, sandbox_info["cpu_count"], instruction, output_file, mount_docker
         )
 
-        # Bake filter values into the initial prompt so Claude calls
-        # scan_claim_next with the right args. Empty list → no filter.
-        filter_prog_json = json.dumps(h1_programs)
-        filter_at_json = json.dumps(h1_asset_types)
+        # Bake filter values into the initial prompt. Empty list → no filter.
+        filter_platform_json = json.dumps(platform)
+        filter_prog_json = json.dumps(bounty_programs)
+        filter_at_json = json.dumps(bounty_asset_types)
 
-        initial_prompt = f"""H1 BOUNTY MODE — WORK QUEUE PROTOCOL
+        initial_prompt = f"""STRIX BOUNTY MODE — interactive, user-driven
 
-You are operating against the user's HackerOne queue. The local SQLite
-(via MCP tools) is the authoritative work list. No -t target was supplied —
-your job is to pick from the queue, scan, record, and loop.
+You have the full set of pentest tools PLUS a persistent bounty ledger
+(SQLite at ~/.strix/strix.db) reached via these MCP tools:
 
-FILTERS FOR THIS SESSION (passed verbatim to scan_claim_next):
+  H1:        h1_sync_programs, h1_list_programs, h1_get_scope
+  Intigriti: intigriti_sync_programs, intigriti_list_programs, intigriti_get_scope
+  Queue:    scan_claim_next, scan_mark_done, scan_mark_skipped, scan_status, scope_summary
+  Findings: finding_create, finding_confirm, finding_reject, finding_list
+
+NOTHING has been auto-synced. NOTHING has been auto-claimed. You wait for the user.
+
+CURRENT DB STATE (snapshot taken at session start — may be stale, refresh on request):
+{state_block}
+
+SESSION FILTERS (apply these when calling scan_claim_next / scope_summary):
+  source          = {filter_platform_json}      // null = both platforms
   program_handles = {filter_prog_json}
-  asset_types     = {filter_at_json}
-  (empty list = no filter on that dimension)
+  asset_types     = {filter_at_json}            // empty list = no filter
 
 ==============================================================================
-PHASE 0 — SYNC AND SELECT
+OPERATIONS — interpret user's natural language; they will not type tool names
 ==============================================================================
 
-1. Call scope_summary() with no args.
-   - If it returns [] → the local DB is empty. Call h1_sync_programs() to pull
-     programs and scopes from the HackerOne API. Then call scope_summary() again.
-   - h1_sync_programs may take 1–5 minutes the first time. Do not retry on
-     timeout; just wait.
+SYNC (only on explicit user request — never sync proactively):
+  "sync h1"          → h1_sync_programs()
+  "sync intigriti"   → intigriti_sync_programs()
+  "sync all"         → both, in sequence
+  Sync can take 1–5 minutes the first time. Do not retry on timeout; just wait.
 
-2. If the filters above contain non-empty values for BOTH program_handles AND
-   asset_types: skip the interactive picker and proceed straight to LOOP.
+INSPECT (read-only; safe to call freely):
+  "what programs"          → h1_list_programs() / intigriti_list_programs()
+  "scope <handle>"         → h1_get_scope(handle) or intigriti_get_scope(handle)
+  "summary" / "overview"   → scope_summary(source=...)
+  "status"                 → scan_status(source=...)
+  "findings"               → finding_list()
+  "confirmed" / "ready"    → finding_list(status="confirmed")
+  "candidates"             → finding_list(status="candidate")
 
-3. Otherwise: render an interactive picker.
-   - Print scope_summary() as a table grouped by program. Show top 30 programs
-     by total target count, with their asset types and per-status counts.
-     For each program also show a "★" line if offers_bounty == 1.
-   - Ask the user (EXACTLY this line, then WAIT):
+WORK (start the scan loop — only on explicit user request):
+  "work" / "go"                          → use session filters above
+  "work h1"                              → scan_claim_next(source="h1", ...)
+  "work intigriti"                       → scan_claim_next(source="intigriti", ...)
+  "work shopify SOURCE_CODE"             → claim with those overrides
 
-       Pick a program handle (or "any"). Then which asset_types? (comma-separated, or "all")
-       e.g.  shopify SOURCE_CODE,URL    |    any SOURCE_CODE    |    gitlab all
+  LOOP:
+    1. t = scan_claim_next(source=..., program_handles=..., asset_types=...)
+       If t.target is None → stop the loop. Tell the user.
+    2. Set up the target by asset_type:
+         SOURCE_CODE     → terminal_execute: git clone --depth 1 <identifier> /workspace/<slug>
+                           Then whitebox phases (component discovery → testing → re-validation).
+         URL             → recon (httpx/nuclei), then blackbox phases.
+         DOMAIN          → subfinder + dnsx + httpx, then per-host blackbox.
+         WILDCARD        → enumerate sub-assets; record findings under the parent target.id.
+                           Do NOT call scan_claim_next for sub-assets.
+         IP_ADDRESS      → nmap -p- -sV + service-specific testing.
+         MOBILE_*, HARDWARE, EXECUTABLE, OTHER → scan_mark_skipped(reason="unsupported asset_type=...")
+    3. Honor target.instruction (RoE). Drop any planned action that violates it.
+    4. For each candidate vuln: finding_create(target_id=t.target.id, ..., status='candidate')
+    5. Spawn a fresh validator subagent per candidate (NO prior context, just the PoC).
+         VALID            → finding_confirm(finding_id=<id>, validator_notes="…")
+         FALSE_POSITIVE   → finding_reject(finding_id=<id>, reason="…")
+    6. scan_mark_done(target_id=t.target.id, summary="<one line>")
+    7. Loop unless the user has interrupted.
 
-   - Parse the reply. Set:
-       filter_program     = [<handle>] if user picked one, else []
-       filter_asset_types = list from reply, mapped to UPPER_CASE, [] if "all"
-     Confirm back to the user in one short line: "Filtering to: program=… asset_types=…"
-
-==============================================================================
-LOOP — runs until queue empty
-==============================================================================
-
-While True:
-    res = scan_claim_next(program_handles=filter_program, asset_types=filter_asset_types)
-    if res.target is None:
-        print "Queue empty for these filters." and break.
-
-    target = res.target   # {{id, program_handle, asset_type, identifier, max_severity, instruction, ...}}
-
-    PRINT one status line: "→ <program_handle> [<asset_type>] <identifier> (#<id>)"
-
-    SET UP the target by asset_type:
-      SOURCE_CODE
-          slug = a safe filename from identifier
-          terminal_execute: git clone --depth 1 "<identifier>" "/workspace/<slug>"
-          Run the whitebox phases (PHASE 1 component discovery → testing
-          → re-validation) from your system prompt against /workspace/<slug>.
-
-      URL
-          recon (httpx/nuclei) then blackbox phases against identifier.
-
-      DOMAIN
-          subfinder + dnsx + httpx, then per-host blackbox.
-
-      WILDCARD
-          Enumerate sub-assets from the wildcard (subfinder etc.). Treat each
-          sub-asset as work under THIS target_id. Do NOT call scan_claim_next
-          for sub-assets — record findings against the parent target.id.
-
-      IP_ADDRESS / IP_RANGE
-          nmap -p- -sV then service-specific testing.
-
-      anything else (HARDWARE, EXECUTABLE, OTHER, …)
-          scan_mark_skipped(target.id, reason="unsupported asset_type=<type>")
-          continue
-
-    HONOR scope instructions: target.instruction often says things like
-    "no DoS", "no automated scanners on prod", "production hostnames excluded".
-    Read it. If a planned action violates it, drop that action.
-
-    SCAN. Use the system-prompt phases. Do not invent new ones.
-
-    FOR EACH candidate vulnerability:
-        finding_create(
-            target_id  = target.id,
-            title      = "...",
-            severity   = "low|medium|high|critical",
-            vuln_type  = "...",
-            asset      = "<specific URL / file:line>",
-            poc_path   = "<path to PoC file in /workspace or host>",
-            notes      = "<short reproducer summary>"
-        )
-        # Status defaults to 'candidate'
-
-    INDEPENDENT VALIDATOR — for each candidate:
-        Spawn a fresh subagent with no prior context. Pass it ONLY the
-        finding's PoC and asset. Ask it to decide VALID vs FALSE_POSITIVE
-        using strict external-attacker H1 triage standards.
-        On VALID  → finding_confirm(finding_id=<id>, validator_notes="…")
-        On FALSE_POSITIVE → finding_reject(finding_id=<id>, reason="…")
-
-    scan_mark_done(
-        target_id = target.id,
-        summary   = "<one short line: what was tested, what was/was-not found>"
-    )
-
-==============================================================================
-WHEN THE LOOP EXITS
-==============================================================================
-
-- scan_status()           → report counts to the user.
-- finding_list(status="confirmed") → list everything ready for manual submission.
-- finding_list(status="candidate") → flag anything left un-validated.
-- STOP. Do NOT loop again unless the user asks. Do NOT call any
-  HackerOne write endpoint — submission is manual on hackerone.com.
+ONE-OFF SCAN (user names a URL/repo directly, e.g. "scan https://example.com"):
+  Use the existing pentest tools directly. Do NOT record in the bounty DB
+  unless the user explicitly asks ("record this to <program>").
 
 ==============================================================================
 HARD RULES
 ==============================================================================
 
-- NEVER call HackerOne API write endpoints. There are none exposed in MCP —
-  if you find yourself wanting one, stop.
-- NEVER spend > 30 minutes on a single target without calling finding_create,
-  scan_mark_done, or scan_mark_skipped. If stuck, mark skipped with reason.
-- NEVER mix in unrelated targets. Stay in the queue.
+- NEVER sync without an explicit user request. Even if the DB is empty —
+  TELL the user it's empty and ask them which platform to sync.
+- NEVER auto-start the work loop. Wait for the user's go-ahead.
+- NEVER call HackerOne or Intigriti write/submission endpoints. There are
+  none exposed via MCP. Submission stays manual on hackerone.com / intigriti.com.
 - NEVER scan an asset whose target.eligible_for_bounty == 0 unless the user
-  explicitly told you to. Use scan_mark_skipped(reason="not eligible for bounty").
+  explicitly tells you to. Use scan_mark_skipped(reason="not eligible for bounty").
+- NEVER spend > 30 min on a single target during a work loop without calling
+  finding_create, scan_mark_done, or scan_mark_skipped. If stuck → skip with reason.
 
-START PHASE 0 NOW. Call scope_summary() first.
+==============================================================================
+YOUR FIRST MESSAGE
+==============================================================================
+
+Your first message MUST be EXACTLY this format (substitute real numbers from
+the DB STATE block above — DO NOT call any tool to compute them, use the
+state block verbatim):
+
+  Bounty queue ready.
+  {state_block}
+
+  Filters: platform={platform or 'any'}, programs={bounty_programs or 'any'}, asset_types={bounty_asset_types or 'any'}
+
+  What would you like? (sync h1 / sync intigriti / inspect / work / scan-one-off)
+
+Then WAIT for the user. Do not call any tool until they tell you what to do.
 """
 
-        console.print("\n[bold]Starting Claude CLI for H1 work queue...[/bold]\n")
+        console.print("\n[bold]Starting Claude CLI for bounty queue...[/bold]\n")
         console.print("=" * 60)
 
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
@@ -1233,7 +1241,7 @@ START PHASE 0 NOW. Call scope_summary() first.
             )
 
         console.print("\n" + "=" * 60)
-        console.print("[bold]H1 session ended.[/bold]")
+        console.print("[bold]Bounty session ended.[/bold]")
 
     except SandboxError as e:
         console.print(f"[red]Sandbox error:[/red] {e}")
@@ -1310,9 +1318,11 @@ def classify_target(target: str) -> dict[str, str]:
 @click.option("--mount-docker", is_flag=True, help="Mount Docker socket for container scanning (trivy, docker inspect, etc.)")
 @click.option("--keep-container", is_flag=True, help="Keep container running after scan")
 @click.option("--scan-id", help="Scan ID (used by TUI for tracking)")
-@click.option("--h1", "h1_mode", is_flag=True, help="HackerOne work-queue mode: pull programs/scopes from H1 API, scan from the local queue, record findings to ~/.strix/strix.db. Requires H1_USERNAME and H1_TOKEN in env.")
-@click.option("--program", "h1_programs", multiple=True, help="(H1 mode) Limit claims to this program handle. Can be repeated.")
-@click.option("--asset-types", "h1_asset_types", help="(H1 mode) Comma-separated asset types to claim (e.g. SOURCE_CODE,URL).")
+@click.option("--platform", type=click.Choice(["h1", "intigriti"]), default=None, help="Bounty mode: limit work queue to one platform. Without this flag, bounty mode pulls from both H1 and Intigriti.")
+@click.option("--h1", "h1_alias", is_flag=True, help="Alias for --platform h1.")
+@click.option("--intigriti", "intigriti_alias", is_flag=True, help="Alias for --platform intigriti.")
+@click.option("--program", "bounty_programs", multiple=True, help="(Bounty mode) Limit claims to this program handle. Can be repeated.")
+@click.option("--asset-types", "bounty_asset_types", help="(Bounty mode) Comma-separated asset types to claim (e.g. SOURCE_CODE,URL).")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def main(
     targets: tuple[str, ...],
@@ -1324,9 +1334,11 @@ def main(
     mount_docker: bool,
     keep_container: bool,
     scan_id: str | None,
-    h1_mode: bool,
-    h1_programs: tuple[str, ...],
-    h1_asset_types: str | None,
+    platform: str | None,
+    h1_alias: bool,
+    intigriti_alias: bool,
+    bounty_programs: tuple[str, ...],
+    bounty_asset_types: str | None,
     verbose: bool,
 ):
     """Strix Claude Code - AI-powered penetration testing using Claude CLI.
@@ -1362,25 +1374,30 @@ def main(
     if instruction_file:
         instruction = Path(instruction_file).read_text()
 
-    # HackerOne work-queue mode: targets come from the local DB, not -t.
-    if h1_mode:
-        if not os.environ.get("H1_USERNAME") or not os.environ.get("H1_TOKEN"):
-            console.print(Panel(
-                "[red]H1_USERNAME and H1_TOKEN must be set in env for --h1 mode.[/red]\n\n"
-                "Add to your shell rc:\n"
-                "  export H1_USERNAME=<your-h1-api-username>\n"
-                "  export H1_TOKEN=<your-h1-api-token>",
-                title="Missing HackerOne credentials",
-            ))
+    # Resolve platform from --platform / --h1 / --intigriti. Explicit --platform wins.
+    resolved_platform: str | None = platform
+    if not resolved_platform:
+        if h1_alias and intigriti_alias:
+            console.print("[red]--h1 and --intigriti cannot be combined; use --platform if you mean both.[/red]")
             sys.exit(1)
+        if h1_alias:
+            resolved_platform = "h1"
+        elif intigriti_alias:
+            resolved_platform = "intigriti"
+
+    # Bounty mode is the default when no -t target is supplied. All MCP tools
+    # (both H1 and Intigriti) are loaded regardless; the platform/program/asset
+    # filters just narrow what scan_claim_next will return.
+    if not targets:
         asset_types_list = (
-            [a.strip().upper() for a in h1_asset_types.split(",") if a.strip()]
-            if h1_asset_types
+            [a.strip().upper() for a in bounty_asset_types.split(",") if a.strip()]
+            if bounty_asset_types
             else []
         )
-        _handle_h1_scan(
-            h1_programs=list(h1_programs),
-            h1_asset_types=asset_types_list,
+        _handle_bounty_session(
+            platform=resolved_platform,
+            bounty_programs=list(bounty_programs),
+            bounty_asset_types=asset_types_list,
             scan_mode=scan_mode,
             instruction=instruction,
             output_file=output_file,
@@ -1889,57 +1906,382 @@ Output a TODO list of suspected vulnerabilities derived from the intel, with the
             has_vscode_target = any(ct.get("kind") == "vscode" for ct in extension_targets_present)
             vscode_trust_rule = ""
             if has_vscode_target:
-                vscode_trust_rule = """
-VS CODE WORKSPACE-TRUST RULE — DO NOT SHORT-CIRCUIT, HUNT FOR BYPASSES FIRST:
-Background — three major programs have closed "RCE after trust" as out of scope:
-  - Google Cloud VRP (Cody YOLO): "YOLO mode... can only be used in a trusted workspace... by design."
-  - Shopify (theme-check `require:`): "Code execution via developer-authored config in local development tooling is out of bounty scope... the decision to trust the source of the repository sits with the developer."
-  - Salesforce (salesforcedx java.home): "If the victim trusts the workspace then this is expected behaviour for IDEs since code execution is part of its use."
+                vscode_trust_rule = r"""
+==============================================================================
+VS CODE EXTENSION REVIEW CHECKLIST — work through every section in order.
+==============================================================================
 
-So the easy "looks trust-gated" path is dead. BUT — do NOT drop the finding the moment you see trust is involved. The same primitive (e.g. `require()` of workspace data, `child_process.exec` of a workspace setting, JSON.parse + eval) is often reachable through OTHER paths that do NOT require trust. The vulnerable code is the same; only the trigger changes. Your job is to interrogate every "trust-gated" candidate for a no-trust trigger BEFORE deciding it is out of scope.
+This is the authoritative review structure. Each area lists: WHAT to check →
+WHERE to look → grep PATTERN to find candidates → SECURE-vs-VULN pattern.
+Do not skip sections; mark each "OK / FINDING / N/A (reason)" in your notes.
 
-For each candidate finding that appears to need trust, exhaustively check for at least these bypass surfaces — go read the actual manifest and the actual code, do not guess:
+------------------------------------------------------------------------------
+0. RECON & SETUP
+------------------------------------------------------------------------------
+WHAT: extract the .vsix (it's a zip), beautify minified bundles, separate
+      first-party extension code from vendored node_modules / webpack chunks.
+      Identify the publisher, the displayName, the engines.vscode constraint,
+      and whether any signing/integrity metadata is present.
+WHERE: /workspace/<ext>/extension.vsixmanifest, package.json, dist/, out/,
+       node_modules/, .vscodeignore (negative space).
+GREP:  rg -l "webpack" /workspace/<ext> ; rg -n "\"publisher\"" package.json ;
+       find . -name "*.min.js" -o -name "*.bundle.js"
+SECURE pattern: source maps present, no minified vendored code in first-party
+                paths, no secret-looking strings in published assets, source is
+                reasonably reviewable as-is.
+VULN pattern: hard-coded API keys / signing keys / telemetry tokens in the
+              bundle; postinstall scripts in vendored deps; binary blobs
+              executed at activation with no integrity check.
 
-1. activationEvents reachable without trust. A few events fire BEFORE the trust prompt or in Restricted Mode:
-   - `onUri` / URI handlers — a `vscode://publisher.ext/...` link clicked in a browser can activate the extension before the user has trusted anything. Read `package.json` activationEvents and the `window.registerUriHandler` callsites.
-   - `onAuthenticationRequest`, `onCustomEditor`, `onWebviewPanel` reopen — can fire from VS Code session restore.
-   - `onLanguage:<id>` for a language the extension handles — an untitled buffer in that language activates it.
-   - `onCommand:<cmd>` if the command is callable from a URI or another extension.
-   - `*` (universal activation) — extension runs in Restricted Mode unless capabilities say otherwise.
+Also do: rg -nE "(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}" .
 
-2. `capabilities.untrustedWorkspaces` declaration. Read it carefully:
-   - `"supported": true` → the extension claims it is SAFE in Restricted Mode. If any code path in Restricted Mode reaches a sink (require/exec/eval/spawn/child_process), that's a real finding: the extension lied.
-   - `"supported": "limited"` with `restrictedConfigurations: [...]` → only the listed settings are blocked. Any OTHER setting that reaches a sink is in scope.
-   - `"supported": false` and missing — finding fires only after trust. Still check the other bypass surfaces below before dropping.
+------------------------------------------------------------------------------
+1. MANIFEST MAP — build the attack-surface inventory FIRST
+------------------------------------------------------------------------------
+WHAT: enumerate every entry point and every untrusted-input boundary the
+      manifest declares. You cannot review what you have not enumerated.
+WHERE: package.json fields — activationEvents, main/browser, contributes.{
+       commands, configuration, customEditors, viewsContainers,
+       jsonValidation, languages, taskDefinitions, debuggers,
+       authenticationProviders, walkthroughs, semanticTokenScopes, menus},
+       capabilities.{ untrustedWorkspaces, virtualWorkspaces }, enabledApiProposals.
+GREP:  jq '.activationEvents, .contributes.commands[].command, .contributes.configuration.properties, .capabilities, .enabledApiProposals' package.json
+SECURE pattern: narrow activationEvents (no `*`); explicit untrustedWorkspaces
+                declaration; no enabledApiProposals beyond what's used.
+VULN pattern: `*` activation; missing untrustedWorkspaces; URI handler
+              registered without a corresponding scheme allow-list in code;
+              `contributes.menus` exposing destructive commands to webviews
+              with no `when` clause.
 
-3. Webview message handlers (`webview.onDidReceiveMessage`). Webviews can be opened pre-trust by some extensions, AND a malicious web page can frame the webview's iframe URL or postMessage to it. If the message handler ends in eval/require/exec, the trigger is web-reachable, not trust-gated.
+Produce a table: { activationEvent | command | config-key } → file:line of handler.
+EVERY downstream section refers back to this table.
 
-4. Local TCP/Unix servers and IPC. Some extensions bind a port (language server, debug adapter, telemetry, devtools relay). If the bind is on `0.0.0.0` or accepts unauthenticated requests from `localhost`, an attacker on the network or a malicious page using `fetch('http://127.0.0.1:<port>')` can reach the sink without trust.
+------------------------------------------------------------------------------
+2. WORKSPACE TRUST POSTURE — the trust discipline (read all of this)
+------------------------------------------------------------------------------
+Background — three major programs have CLOSED "RCE after trust" as out of scope:
+  - Google Cloud VRP (Cody YOLO):       trusted-workspace execution is by design.
+  - Shopify (theme-check `require:`):   developer-authored config in local tooling is out of scope.
+  - Salesforce (salesforcedx java.home):code exec is expected behaviour of trusted IDEs.
 
-5. OAuth / authentication callback handlers. Registered via URI handlers — they fire pre-trust and often parse attacker-controlled redirect-URI params.
+So the easy "looks trust-gated" path is dead. BUT — do NOT drop the finding
+the moment you see trust involved. The same primitive (require() of workspace
+data, child_process.exec of a workspace setting, JSON.parse+eval) is often
+reachable via OTHER triggers that do not require trust. The vulnerable code
+is the same; only the trigger changes.
 
-6. Auto-update / "download latest binary" code paths that run on activation. The download URL can be poisoned via DNS, a workspace-supplied config, or a previously-cached value.
-
-7. Telemetry / crash-report endpoints in the extension that read workspace data and POST to a configurable URL.
-
-8. Clipboard / notification / quickPick handlers that fire on user actions other than trust.
-
-9. Race condition on the trust prompt. If the extension activates and starts work BEFORE the trust prompt is answered (some extensions short-circuit during startup), the sink may fire in an unrestricted window.
-
-10. Same-publisher chained extensions. If extension A activates without trust (e.g. has correct `untrustedWorkspaces.supported: true`) and calls into vulnerable extension B's API, the bug fires from A's no-trust context.
+WHAT: read `capabilities.untrustedWorkspaces`. Then for every sink reachable
+      only-after-trust, exhaustively interrogate the surfaces in sections
+      3, 4, 5, 6, 10, 11, 12 for a NO-TRUST trigger that hits the same sink.
+WHERE: package.json capabilities; every activation callback; URI handlers;
+       webview message handlers; any local network bind; auto-update path.
+GREP:  jq '.capabilities.untrustedWorkspaces' package.json
+SECURE pattern (declaration):
+   - `"supported": false`  — extension is gated to trusted workspaces; AND
+     no pre-trust surface reaches the sink. Drop only after checking 3+4+5+6+10+11+12.
+   - `"supported": "limited", "restrictedConfigurations": [<exhaustive list>]` —
+     every setting that flows into a sink is in the list.
+VULN pattern:
+   - `"supported": true` and a code path in Restricted Mode reaches a sink
+     (require/exec/eval/spawn/child_process) — the extension LIED. Real finding.
+   - `"supported": "limited"` with a missed config key reaching a sink — in scope.
+   - Activation race: extension does work BEFORE awaiting the trust prompt,
+     opening an unrestricted window.
 
 Decision rule:
-- If ANY of the above gives you a no-trust trigger that reaches the same sink → KEEP the finding, but rewrite the title/PoC to use that trigger, not the trust-gated one. State explicitly which no-trust path you confirmed.
-- If you have read the manifest, the activation code, the URI handlers, the webview handlers, the network servers, and every other applicable surface, AND none of them reach the sink without trust → THEN drop it as trust-gated.
+- If any section 3–12 gives you a no-trust trigger reaching the same sink →
+  KEEP the finding; rewrite title/PoC to use that trigger. State explicitly
+  which no-trust path you confirmed.
+- ONLY drop as trust-gated AFTER reading: the manifest, activation code, URI
+  handlers, webview handlers, network binds, auto-update paths, and chained
+  extensions. Log: "Dropped: trust required (checked URI, webview, untrust=
+  false, no net bind, no chain)".
 
-When dropping, log a one-line reason of WHAT bypasses you checked, e.g.:
-  "Dropped: trust required (checked URI handler, webview msg, untrustedWorkspaces=false, no network bind)"
+After finish_scan, append exactly: `Dropped (Workspace Trust / opt-in required): <count>`
+(Print the line with `0` if none were dropped.)
 
-Apply this filter during your reassessment, BEFORE running the independent validator subagents. Keep a count of confirmed trust-gated findings you drop. After finish_scan, append exactly one extra line to your final output:
+------------------------------------------------------------------------------
+3. PROTOCOL HANDLERS / DEEPLINKS
+------------------------------------------------------------------------------
+WHAT: every URI handler — `vscode://publisher.ext/<route>...` — is web-reachable.
+      Clicking a link in a browser fires the handler BEFORE workspace trust.
+      Routes commonly carry attacker-controlled params used in commands, file
+      paths, OAuth callbacks, downloads, or vscode.commands.executeCommand.
+WHERE: `window.registerUriHandler({ handleUri })`, `vscode.window.registerUriHandler`,
+       `package.json` activationEvents containing `onUri:`,
+       `authenticationProviders` callbacks.
+GREP:  rg -nE "registerUriHandler|handleUri\s*[:(]|onUri:" .
+SECURE pattern:
+  - Route allow-list before dispatch.
+  - Signed payload (HMAC) when the link triggers a state change.
+  - OAuth: PKCE + state param verified against stored value.
+  - User confirmation modal for any destructive action.
+VULN pattern:
+  - Switch on path with no allow-list; payload deserialized + acted on.
+  - OAuth callback parses redirect/code without PKCE/state, allowing token
+    injection into the wrong session.
+  - URI param flows into exec / require / writeFile / openFolder / executeCommand
+    without sanitization.
+  - "Trusted MarkdownString" rendered from URI text without enabledCommands gate
+    (see section 8).
 
-  Dropped (Workspace Trust / opt-in required): <count>
+PoC: have the attacker page do `location.href = "vscode://publisher.ext/<route>?...="`
+or render `<a href>` and trigger user click. Confirm the sink fires.
 
-If zero were dropped, still print the line with `0`.
+------------------------------------------------------------------------------
+4. WEBVIEWS
+------------------------------------------------------------------------------
+WHAT: webviews are full HTML in an iframe. The extension chooses CSP, sets
+      webview.html, and routes postMessage via onDidReceiveMessage. Any
+      sink behind the message handler is reachable from JS inside the webview,
+      which is reachable from attacker HTML if CSP is weak or origins are wide.
+WHERE: `vscode.window.createWebviewPanel`, `webview.html = ...`,
+       `webview.onDidReceiveMessage`, `webviewOptions.enableScripts`,
+       `localResourceRoots`, `webview.asWebviewUri`.
+GREP:  rg -nE "createWebviewPanel|webview\.html\s*=|onDidReceiveMessage|enableScripts:\s*true|localResourceRoots|innerHTML|v-html|dangerouslySetInnerHTML"
+SECURE pattern:
+  - CSP: `default-src 'none'; script-src 'nonce-...' ${webview.cspSource};
+    style-src ${webview.cspSource} 'unsafe-inline'; img-src ${webview.cspSource} data:`.
+  - Strict nonce per render; no `'unsafe-inline'` / `'unsafe-eval'` in script-src.
+  - `localResourceRoots` restricted to extension resource dirs.
+  - Message handler validates `message.type` against an allow-list, then
+    type-checks each field, before dispatch.
+  - No `innerHTML` / `v-html` / `dangerouslySetInnerHTML` on attacker-controlled
+    strings; use textContent / framework-escaped binding.
+VULN pattern:
+  - CSP missing, `default-src *`, or includes `unsafe-eval`/`unsafe-inline` in script-src.
+  - `enableScripts: true` + wide `localResourceRoots: [Uri.file('/')]`.
+  - Message handler dispatches by string without allow-list → eval/exec/writeFile.
+  - HTML built with template literals interpolating untrusted data → XSS inside
+    the webview, then escape to extension host via postMessage.
+  - Iframe URL is a public origin reachable via DNS rebinding.
+
+PoC: open the webview from a normal flow, then in DevTools panel paste
+`acquireVsCodeApi().postMessage({type:"...",payload:"..."})` and confirm the sink.
+
+------------------------------------------------------------------------------
+5. COMMAND / PROCESS EXEC
+------------------------------------------------------------------------------
+WHAT: any time the extension invokes a binary, follow the receiver back to
+      its source. The most common bug is `child_process.exec`/`spawn` with
+      `shell: true` and an interpolated workspace value.
+WHERE: `child_process.{exec,execSync,execFile,spawn,spawnSync,fork}`,
+       `util.promisify(exec)`, `execa`, `cross-spawn`, `shelljs`,
+       `vscode.tasks.executeTask`, `pty.spawn`, terminals via `createTerminal`+sendText.
+GREP:  rg -nE "(child_process\.|require\(['\"]child_process)\.(exec|spawn|execFile|fork)\b|shell:\s*true|sendText\s*\(" .
+SECURE pattern:
+  - `execFile(bin, [args...])` with array args; no shell interpretation.
+  - Receiver is a *fixed* string (constant or imported builtin), not user data.
+  - Argument array contains only validated tokens (regex / enum check).
+VULN pattern:
+  - `exec(\`${userInput} ...\`)` or `spawn(cmd, { shell: true })`.
+  - `execFile(userPath, ...)` where userPath comes from a config / workspace file.
+  - Terminal.sendText with interpolated workspace data and no escaping.
+
+Common FP to RULE OUT FIRST: `RegExp.prototype.exec` and protobuf message
+`.fork()` are NOT child_process. Resolve the receiver before reporting.
+
+------------------------------------------------------------------------------
+6. LANGUAGE SERVER / EXTERNAL BINARIES
+------------------------------------------------------------------------------
+WHAT: many extensions launch an LSP, debug adapter, or vendored CLI. If the
+      binary path is *configurable* and not validated, a workspace setting
+      can point at an attacker-controlled binary (the classic Salesforce
+      `java.home` pattern).
+WHERE: `vscode-languageclient`, `LanguageClient` constructor,
+       `DebugAdapterExecutable`, `vscode.workspace.getConfiguration(...).get(<binPath>)`.
+GREP:  rg -nE "LanguageClient|DebugAdapterExecutable|getConfiguration.*\.get\(.*(path|home|bin)" .
+SECURE pattern:
+  - Fixed bundled binary path inside the extension dir.
+  - If configurable: path is in `restrictedConfigurations` of the trust
+    capability; AND validated to be absolute + readable + within an
+    allow-listed dir.
+VULN pattern:
+  - Binary path read from workspace config, NOT in restrictedConfigurations.
+  - Path treated as opaque string and passed to spawn — no allow-list, no
+    "is this inside extension dir / system PATH" check.
+  - PATH search via `which` over a workspace-controlled PATH env override.
+
+------------------------------------------------------------------------------
+7. CONFIG-DRIVEN RCE (auto-load vs approval)
+------------------------------------------------------------------------------
+WHAT: extensions that load JS/Python/etc. from a workspace settings key,
+      a `.vscode/*.json`, or an extension-specific config file. The bug is
+      auto-load on open (no user gesture) without an approval list.
+WHERE: anywhere the extension does `require(p)`, `import(p)`, `vm.runInNew*`,
+       `new Function(...)`, `eval(...)`, `Module._compile`, dynamic plugin
+       loaders ("plugins": [...] in config).
+GREP:  rg -nE "\brequire\s*\(.+\)|\bimport\s*\(.+\)|new\s+Function\b|vm\.|\beval\s*\(|Module\._compile" .
+SECURE pattern:
+  - Approval gate keyed on the SETTING (not just file existence); approval
+    persisted per (workspace × setting value); revoked on value change.
+  - Plugins resolved only from extension dir / a fixed user dir, never from
+    the workspace.
+VULN pattern:
+  - "plugins" array auto-loaded from workspace config; approval not bound to
+    the value (just first-run gate, then permanent yes).
+  - Approval key omits the config value, so swapping the value bypasses approval.
+  - require() of a path computed from workspace data with no allow-list.
+
+------------------------------------------------------------------------------
+8. TRUSTED MARKDOWNSTRING — isTrusted vs enabledCommands
+------------------------------------------------------------------------------
+WHAT: `MarkdownString` with `isTrusted: true` renders `command:` URIs as
+      clickable. If the extension does not pass an `enabledCommands` allow-list,
+      ANY VS Code command (including `workbench.action.terminal.sendSequence`)
+      fires on click. Common 1-click RCE primitive.
+WHERE: `new vscode.MarkdownString(...)`, `.isTrusted = true`, hover providers,
+       status bar tooltips, walkthrough steps.
+GREP:  rg -nE "MarkdownString|isTrusted\s*[:=]\s*true|appendMarkdown\s*\(" .
+SECURE pattern:
+  - `isTrusted: false` (default), OR
+  - `isTrusted: { enabledCommands: ['ext.specificCmd1', 'ext.specificCmd2'] }`
+    with a *narrow* allow-list.
+VULN pattern:
+  - `md.isTrusted = true` with no enabledCommands — full command palette.
+  - Hover content built from workspace data → user hovers, attacker's
+    `command:workbench.action.terminal.sendSequence?...` fires.
+
+------------------------------------------------------------------------------
+9. AUTH / TOKEN HANDLING
+------------------------------------------------------------------------------
+WHAT: extensions store API tokens (GitHub, OpenAI, internal services). Two
+      common bugs: token sent to wrong host (substring match instead of exact),
+      and token logged / sent to telemetry / written to workspace files.
+WHERE: `vscode.authentication.getSession`, `SecretStorage.{get,store}`,
+       `keytar`, axios/fetch interceptors that attach auth headers,
+       telemetry hooks, log appenders.
+GREP:  rg -nE "authentication\.getSession|SecretStorage|keytar|Authorization:\s*['\"]Bearer|axios\.create|interceptors\.request" .
+SECURE pattern:
+  - Token attached ONLY when host exactly matches a fixed allow-list.
+  - SecretStorage used for persistence; never written to workspace state /
+    globalState / files.
+  - Telemetry strips tokens via a redact filter applied to ALL payload paths.
+VULN pattern:
+  - `if (url.includes('api.github.com'))` instead of `new URL(url).host === 'api.github.com'`
+    — attacker controls `https://evil.com/api.github.com/...` and token leaks.
+  - Token logged in console / output channel / problemMatcher.
+  - Bearer added to *every* outgoing request via global interceptor.
+
+------------------------------------------------------------------------------
+10. SSRF / OUTBOUND
+------------------------------------------------------------------------------
+WHAT: extensions that make outbound HTTP from workspace data — model proxy
+      URLs, AI provider endpoints, "fetch this docs URL", import-from-URL.
+WHERE: `fetch`, `axios`, `http.request`, `https.request`, `got`, `node-fetch`,
+       MCP client / language-model provider configs.
+GREP:  rg -nE "\b(fetch|axios|got|http\.request|https\.request|node-fetch)\b" .
+SECURE pattern:
+  - Host allow-list before dispatch; rejects private/loopback ranges (10/8,
+    172.16/12, 192.168/16, 127/8, ::1, link-local, metadata 169.254/16).
+  - DNS pinned via `lookup` hook OR resolved + checked, then requested by IP.
+  - Disallow `file:` / `data:` / scheme-not-in-(http,https).
+VULN pattern:
+  - URL accepted from workspace setting / chat input / webview message and
+    fetched as-is — SSRF into cloud metadata, internal services, file://.
+  - Allow-list checks the URL *string* (`includes('api.openai.com')`) instead
+    of the parsed URL's host.
+
+------------------------------------------------------------------------------
+11. FS / PATH TRAVERSAL
+------------------------------------------------------------------------------
+WHAT: any file operation joining a base dir with attacker-controlled segments.
+      `path.join` does NOT prevent traversal — `..` collapses past the base.
+      Bug is forgetting containment check on EVERY branch (success and error).
+WHERE: `fs.{readFile,writeFile,readdir,rm,unlink,createReadStream}`,
+       `vscode.workspace.fs.*`, `vscode.Uri.joinPath`,
+       `path.{join,resolve}` followed by fs call.
+GREP:  rg -nE "(fs\.|workspace\.fs\.|Uri\.joinPath|path\.(join|resolve))" .
+SECURE pattern:
+  - `const target = path.resolve(base, userSeg); if (!target.startsWith(base + path.sep)) throw ...`
+    BEFORE every fs call.
+  - Normalize first, then containment check; never just `userSeg.includes('..')`.
+VULN pattern:
+  - `path.join(base, userSeg)` + fs call with no containment check.
+  - Containment check on the success path only; error/cleanup path opens
+    the un-checked variable.
+  - `Uri.joinPath(baseUri, ...userSegs)` followed by `workspace.fs.writeFile`
+    with no fsPath containment check.
+  - Symlink: target inside base resolves to symlink pointing outside.
+
+------------------------------------------------------------------------------
+12. DESERIALIZATION / DYNAMIC CODE
+------------------------------------------------------------------------------
+WHAT: parsing untrusted YAML/TOML/XML/protobuf that supports tag-based class
+      instantiation, OR running user-supplied code through vm/Function/eval.
+WHERE: `js-yaml` `yaml.load` (vs `safeLoad`), `serialize-javascript` deserialize,
+       `node-serialize`, XML with external entities, plist with NSKeyedUnarchiver,
+       any `new Function`, `vm.runInThisContext`, `eval`.
+GREP:  rg -nE "yaml\.load\b|node-serialize|deserialize|new\s+Function|vm\.runIn|eval\s*\(" .
+SECURE pattern:
+  - `yaml.load(s, { schema: yaml.JSON_SCHEMA })` or `yaml.safeLoad` (deprecated alias).
+  - XML parser with entity expansion OFF.
+  - User code runs in `vm.createContext({})` with NO globals OR not at all.
+VULN pattern:
+  - `yaml.load(workspaceFile)` with default schema → `!!js/function` → RCE.
+  - `new Function(userString)()` from a config value or webview message.
+  - protobuf reflection unmarshalling untrusted bytes into typed instances
+    with side-effecting constructors.
+
+==============================================================================
+TRIAGE GATE — 6 questions every candidate finding must answer YES on
+==============================================================================
+Apply BEFORE writing the report. If ANY answer is NO, you do not have a finding.
+
+  Q1. EXTERNAL REACHABILITY. Can an external, unauthenticated attacker reach
+      the sink? Source-code analysis is not reachability — name the trigger
+      (URI handler, webview msg, port bind, hover render, config auto-load).
+
+  Q2. REAL DELIVERY, NOT MITM. Is the trigger deliverable without an attacker
+      already on the network path? (DNS rebinding counts; "if attacker intercepts
+      the response" does not unless there's no HTTPS / no pinning AND a realistic
+      attacker position.)
+
+  Q3. THE GATE — and can you actually bypass it? Identify the gate (Workspace
+      Trust / user confirmation modal / approval list / signed payload).
+      If you cannot describe how an external attacker bypasses it, the gate
+      stands and the finding is intended-functionality.
+
+  Q4. PoC AGAINST UNMODIFIED APP. Did you run the unmodified extension via
+      `code --install-extension <vsix>` and trigger the sink with a real
+      payload, OR did you only read code? Code-only is informative. PoC against
+      a forked/patched build is informative.
+
+  Q5. FIRST-PARTY vs VENDORED. Is the vulnerable code in first-party extension
+      source, or inside `node_modules/<dep>/`? Vendored bugs go upstream;
+      they are not a finding against this extension UNLESS the extension
+      pinned a known-vulnerable version while a fix exists.
+
+  Q6. BACKEND-DEPENDENT = UNPROVEN. If the impact requires "the backend
+      server returns X", you have not proven it — that's a finding against
+      the backend, not the extension. Test against the actual production
+      backend or drop.
+
+==============================================================================
+COMMON FALSE POSITIVES — kill these on sight
+==============================================================================
+
+  - `someStr.match(...)` / `regex.exec(...)` — that is RegExp, NOT child_process.
+    Always resolve the receiver before reporting an "exec" sink.
+  - protobuf `Message.fork()` — that is the protobuf writer's fork, NOT
+    child_process.fork.
+  - `eval("require")` and similar shims — Webpack / bundler wrappers; the
+    inner string is a literal, not attacker data.
+  - `innerHTML` set from the extension's OWN JSON (e.g. localized strings
+    bundled in the extension) — author-controlled, not attacker-controlled.
+  - Deeplink that fires a confirmation modal before action — gated; not a
+    finding unless you can bypass the modal (URI race, double-event, etc.).
+  - Webview that LOOKS XSS-able but the CSP is strict (`script-src 'nonce-...'`
+    only, no `unsafe-eval`/`unsafe-inline`) — injection is blocked by CSP.
+    Verify the CSP actually applies (no `<meta http-equiv="Content-Security-Policy">`
+    in HTML being overridden by `webview.html` outer wrapper).
+  - MCP / language-model providers behind an explicit approval list AND the
+    approval is keyed on the FULL config (not just "any provider once").
+  - "Trusted Workspace required" with no pre-trust trigger you can name —
+    see section 2 decision rule.
+
+After section 12 + triage + FP filter is done, run the standard validator
+subagents per remaining finding.
 """
             extension_preamble = f"""TASK: download and security-review the listed browser/IDE extension(s):
 

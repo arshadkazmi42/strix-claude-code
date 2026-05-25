@@ -1,8 +1,13 @@
-"""SQLite-backed persistent store for H1 programs, targets, and findings.
+"""SQLite-backed persistent store for bounty programs, targets, and findings.
 
 Database lives at ~/.strix/strix.db (mode 0700 on parent dir).
 Single writer pattern is enough for this workload; concurrent claims are
 serialized with BEGIN IMMEDIATE in claim_next_target().
+
+Schema versions:
+  1 — h1-only. programs PK = handle. targets UNIQUE (program_handle, asset_type, identifier).
+  2 — multi-platform. programs PK = (source, handle). targets UNIQUE
+      (source, program_handle, asset_type, identifier). source ∈ {'h1', 'intigriti'}.
 """
 
 from __future__ import annotations
@@ -20,7 +25,9 @@ DB_PATH = DB_DIR / "strix.db"
 # How long a row may stay 'in_progress' before another claimer can steal it.
 STALE_CLAIM_SECONDS = 4 * 3600
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+VALID_SOURCES = ("h1", "intigriti")
 
 
 def _ensure_dir() -> None:
@@ -52,68 +59,144 @@ def init_db() -> None:
         current = conn.execute("PRAGMA user_version").fetchone()[0]
 
         if current < 1:
-            conn.executescript(
-                """
-                BEGIN;
-
-                CREATE TABLE IF NOT EXISTS programs (
-                    handle           TEXT PRIMARY KEY,
-                    name             TEXT,
-                    policy_url       TEXT,
-                    offers_bounty    INTEGER NOT NULL DEFAULT 0,
-                    submission_state TEXT,
-                    last_synced_at   INTEGER,
-                    archived         INTEGER NOT NULL DEFAULT 0
-                );
-
-                CREATE TABLE IF NOT EXISTS targets (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    program_handle      TEXT NOT NULL
-                                          REFERENCES programs(handle) ON DELETE CASCADE,
-                    asset_type          TEXT NOT NULL,
-                    identifier          TEXT NOT NULL,
-                    eligible_for_bounty INTEGER NOT NULL DEFAULT 1,
-                    max_severity        TEXT,
-                    instruction         TEXT,
-                    scan_status         TEXT NOT NULL DEFAULT 'pending',
-                                          -- pending|in_progress|done|skipped|error
-                    scan_started_at     INTEGER,
-                    scan_finished_at    INTEGER,
-                    summary             TEXT,
-                    UNIQUE(program_handle, asset_type, identifier)
-                );
-                CREATE INDEX IF NOT EXISTS idx_targets_status
-                    ON targets(scan_status);
-                CREATE INDEX IF NOT EXISTS idx_targets_program
-                    ON targets(program_handle);
-                CREATE INDEX IF NOT EXISTS idx_targets_asset_type
-                    ON targets(asset_type);
-
-                CREATE TABLE IF NOT EXISTS findings (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_id     INTEGER NOT NULL
-                                    REFERENCES targets(id) ON DELETE CASCADE,
-                    title         TEXT NOT NULL,
-                    severity      TEXT,
-                    vuln_type     TEXT,
-                    asset         TEXT,
-                    poc_path      TEXT,
-                    notes         TEXT,
-                    status        TEXT NOT NULL DEFAULT 'candidate',
-                                    -- candidate|confirmed|rejected|submitted|duplicate
-                    h1_report_id  TEXT,
-                    created_at    INTEGER NOT NULL,
-                    updated_at    INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_findings_status
-                    ON findings(status);
-                CREATE INDEX IF NOT EXISTS idx_findings_target
-                    ON findings(target_id);
-
-                COMMIT;
-                """
-            )
+            # Fresh install — create v2 schema directly.
+            _create_v2_schema(conn)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            return
+
+        if current < 2:
+            _migrate_v1_to_v2(conn)
+            conn.execute("PRAGMA user_version=2")
+
+
+def _create_v2_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        BEGIN;
+
+        CREATE TABLE IF NOT EXISTS programs (
+            source           TEXT NOT NULL DEFAULT 'h1',
+            handle           TEXT NOT NULL,
+            name             TEXT,
+            policy_url       TEXT,
+            offers_bounty    INTEGER NOT NULL DEFAULT 0,
+            submission_state TEXT,
+            last_synced_at   INTEGER,
+            archived         INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source, handle)
+        );
+
+        CREATE TABLE IF NOT EXISTS targets (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source              TEXT NOT NULL DEFAULT 'h1',
+            program_handle      TEXT NOT NULL,
+            asset_type          TEXT NOT NULL,
+            identifier          TEXT NOT NULL,
+            eligible_for_bounty INTEGER NOT NULL DEFAULT 1,
+            max_severity        TEXT,
+            instruction         TEXT,
+            scan_status         TEXT NOT NULL DEFAULT 'pending',
+                                  -- pending|in_progress|done|skipped|error
+            scan_started_at     INTEGER,
+            scan_finished_at    INTEGER,
+            summary             TEXT,
+            UNIQUE(source, program_handle, asset_type, identifier),
+            FOREIGN KEY (source, program_handle)
+                REFERENCES programs(source, handle) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_targets_status   ON targets(scan_status);
+        CREATE INDEX IF NOT EXISTS idx_targets_program  ON targets(source, program_handle);
+        CREATE INDEX IF NOT EXISTS idx_targets_asset    ON targets(asset_type);
+        CREATE INDEX IF NOT EXISTS idx_targets_source   ON targets(source);
+
+        CREATE TABLE IF NOT EXISTS findings (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_id     INTEGER NOT NULL
+                            REFERENCES targets(id) ON DELETE CASCADE,
+            title         TEXT NOT NULL,
+            severity      TEXT,
+            vuln_type     TEXT,
+            asset         TEXT,
+            poc_path      TEXT,
+            notes         TEXT,
+            status        TEXT NOT NULL DEFAULT 'candidate',
+                            -- candidate|confirmed|rejected|submitted|duplicate
+            h1_report_id  TEXT,
+            created_at    INTEGER NOT NULL,
+            updated_at    INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+        CREATE INDEX IF NOT EXISTS idx_findings_target ON findings(target_id);
+
+        COMMIT;
+        """
+    )
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    """Add `source` column and composite keys. v1 rows default to source='h1'."""
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(
+        """
+        BEGIN;
+
+        ALTER TABLE programs RENAME TO programs_v1;
+        ALTER TABLE targets  RENAME TO targets_v1;
+
+        CREATE TABLE programs (
+            source           TEXT NOT NULL DEFAULT 'h1',
+            handle           TEXT NOT NULL,
+            name             TEXT,
+            policy_url       TEXT,
+            offers_bounty    INTEGER NOT NULL DEFAULT 0,
+            submission_state TEXT,
+            last_synced_at   INTEGER,
+            archived         INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source, handle)
+        );
+
+        CREATE TABLE targets (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            source              TEXT NOT NULL DEFAULT 'h1',
+            program_handle      TEXT NOT NULL,
+            asset_type          TEXT NOT NULL,
+            identifier          TEXT NOT NULL,
+            eligible_for_bounty INTEGER NOT NULL DEFAULT 1,
+            max_severity        TEXT,
+            instruction         TEXT,
+            scan_status         TEXT NOT NULL DEFAULT 'pending',
+            scan_started_at     INTEGER,
+            scan_finished_at    INTEGER,
+            summary             TEXT,
+            UNIQUE(source, program_handle, asset_type, identifier),
+            FOREIGN KEY (source, program_handle)
+                REFERENCES programs(source, handle) ON DELETE CASCADE
+        );
+
+        INSERT INTO programs
+            (source, handle, name, policy_url, offers_bounty, submission_state, last_synced_at, archived)
+        SELECT 'h1', handle, name, policy_url, offers_bounty, submission_state, last_synced_at, archived
+        FROM programs_v1;
+
+        INSERT INTO targets
+            (id, source, program_handle, asset_type, identifier, eligible_for_bounty,
+             max_severity, instruction, scan_status, scan_started_at, scan_finished_at, summary)
+        SELECT id, 'h1', program_handle, asset_type, identifier, eligible_for_bounty,
+               max_severity, instruction, scan_status, scan_started_at, scan_finished_at, summary
+        FROM targets_v1;
+
+        DROP TABLE targets_v1;
+        DROP TABLE programs_v1;
+
+        CREATE INDEX IF NOT EXISTS idx_targets_status   ON targets(scan_status);
+        CREATE INDEX IF NOT EXISTS idx_targets_program  ON targets(source, program_handle);
+        CREATE INDEX IF NOT EXISTS idx_targets_asset    ON targets(asset_type);
+        CREATE INDEX IF NOT EXISTS idx_targets_source   ON targets(source);
+
+        COMMIT;
+        """
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +210,16 @@ def upsert_program(
     policy_url: str | None,
     offers_bounty: bool,
     submission_state: str | None = None,
+    source: str = "h1",
 ) -> None:
+    if source not in VALID_SOURCES:
+        raise ValueError(f"invalid source: {source}")
     conn.execute(
         """
         INSERT INTO programs
-            (handle, name, policy_url, offers_bounty, submission_state, last_synced_at, archived)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
-        ON CONFLICT(handle) DO UPDATE SET
+            (source, handle, name, policy_url, offers_bounty, submission_state, last_synced_at, archived)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(source, handle) DO UPDATE SET
             name             = excluded.name,
             policy_url       = excluded.policy_url,
             offers_bounty    = excluded.offers_bounty,
@@ -142,6 +228,7 @@ def upsert_program(
             archived         = 0
         """,
         (
+            source,
             handle,
             name,
             policy_url,
@@ -152,29 +239,37 @@ def upsert_program(
     )
 
 
-def list_programs(handle_filter: str | None = None) -> list[dict[str, Any]]:
+def list_programs(
+    handle_filter: str | None = None,
+    source: str | None = None,
+) -> list[dict[str, Any]]:
+    where: list[str] = ["archived=0"]
+    params: list[Any] = []
+    if handle_filter:
+        where.append("handle LIKE ?")
+        params.append(f"%{handle_filter}%")
+    if source:
+        where.append("source = ?")
+        params.append(source)
+    sql = f"SELECT * FROM programs WHERE {' AND '.join(where)} ORDER BY source, handle"
     with get_conn() as conn:
-        if handle_filter:
-            rows = conn.execute(
-                "SELECT * FROM programs WHERE handle LIKE ? AND archived=0 ORDER BY handle",
-                (f"%{handle_filter}%",),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM programs WHERE archived=0 ORDER BY handle"
-            ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
-def mark_programs_archived_except(handles: list[str]) -> None:
-    """Mark all programs NOT in `handles` as archived. Call after a full sync."""
+def mark_programs_archived_except(
+    handles: list[str],
+    source: str = "h1",
+) -> None:
+    """Mark programs of this source NOT in `handles` as archived. Call after a full sync."""
     if not handles:
         return
     placeholders = ",".join("?" * len(handles))
     with get_conn() as conn:
         conn.execute(
-            f"UPDATE programs SET archived=1 WHERE handle NOT IN ({placeholders})",
-            handles,
+            f"UPDATE programs SET archived=1"
+            f" WHERE source=? AND handle NOT IN ({placeholders})",
+            [source, *handles],
         )
 
 
@@ -190,19 +285,23 @@ def upsert_target(
     eligible_for_bounty: bool,
     max_severity: str | None,
     instruction: str | None,
+    source: str = "h1",
 ) -> None:
+    if source not in VALID_SOURCES:
+        raise ValueError(f"invalid source: {source}")
     conn.execute(
         """
         INSERT INTO targets
-            (program_handle, asset_type, identifier, eligible_for_bounty,
+            (source, program_handle, asset_type, identifier, eligible_for_bounty,
              max_severity, instruction, scan_status)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending')
-        ON CONFLICT(program_handle, asset_type, identifier) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+        ON CONFLICT(source, program_handle, asset_type, identifier) DO UPDATE SET
             eligible_for_bounty = excluded.eligible_for_bounty,
             max_severity        = excluded.max_severity,
             instruction         = excluded.instruction
         """,
         (
+            source,
             program_handle,
             asset_type,
             identifier,
@@ -216,6 +315,7 @@ def upsert_target(
 def claim_next_target(
     program_handles: list[str] | None = None,
     asset_types: list[str] | None = None,
+    source: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically claim the next pending (or stale in-progress) target.
 
@@ -228,6 +328,10 @@ def claim_next_target(
         " OR (scan_status = 'in_progress' AND COALESCE(scan_started_at, 0) < ?))"
     ]
     params: list[Any] = [stale_cutoff]
+
+    if source:
+        where_parts.append("source = ?")
+        params.append(source)
 
     if program_handles:
         ph = ",".join("?" * len(program_handles))
@@ -277,32 +381,47 @@ def mark_target(
         )
 
 
-def scan_status_counts(program_handle: str | None = None) -> dict[str, int]:
+def scan_status_counts(
+    program_handle: str | None = None,
+    source: str | None = None,
+) -> dict[str, int]:
+    where: list[str] = []
+    params: list[Any] = []
+    if program_handle:
+        where.append("program_handle=?")
+        params.append(program_handle)
+    if source:
+        where.append("source=?")
+        params.append(source)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     with get_conn() as conn:
-        if program_handle:
-            rows = conn.execute(
-                "SELECT scan_status, COUNT(*) n FROM targets"
-                " WHERE program_handle=? GROUP BY scan_status",
-                (program_handle,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT scan_status, COUNT(*) n FROM targets GROUP BY scan_status"
-            ).fetchall()
+        rows = conn.execute(
+            f"SELECT scan_status, COUNT(*) n FROM targets{where_sql} GROUP BY scan_status",
+            params,
+        ).fetchall()
     return {r["scan_status"]: r["n"] for r in rows}
 
 
-def scope_summary(program_handle: str | None = None) -> list[dict[str, Any]]:
+def scope_summary(
+    program_handle: str | None = None,
+    source: str | None = None,
+) -> list[dict[str, Any]]:
     """Return per-(program × asset_type) counts.
 
     If program_handle is given, return rows for that program only with status breakdown.
-    Otherwise return one row per (program, asset_type) with total + pending counts.
+    Otherwise return one row per (source, program, asset_type) with total + pending counts.
     """
     with get_conn() as conn:
         if program_handle:
+            params: list[Any] = [program_handle]
+            extra = ""
+            if source:
+                extra = " AND source=?"
+                params.append(source)
             rows = conn.execute(
-                """
-                SELECT asset_type,
+                f"""
+                SELECT source,
+                       asset_type,
                        COUNT(*) AS total,
                        SUM(scan_status='pending')      AS pending,
                        SUM(scan_status='in_progress')  AS in_progress,
@@ -310,27 +429,35 @@ def scope_summary(program_handle: str | None = None) -> list[dict[str, Any]]:
                        SUM(scan_status='skipped')      AS skipped,
                        SUM(scan_status='error')        AS errored
                 FROM targets
-                WHERE program_handle=?
-                GROUP BY asset_type
+                WHERE program_handle=?{extra}
+                GROUP BY source, asset_type
                 ORDER BY total DESC
                 """,
-                (program_handle,),
+                params,
             ).fetchall()
         else:
+            params2: list[Any] = []
+            extra2 = ""
+            if source:
+                extra2 = " AND t.source=?"
+                params2.append(source)
             rows = conn.execute(
-                """
-                SELECT t.program_handle,
+                f"""
+                SELECT t.source,
+                       t.program_handle,
                        p.offers_bounty,
                        t.asset_type,
                        COUNT(*) AS total,
                        SUM(t.scan_status='pending') AS pending,
                        SUM(t.scan_status='done')    AS done
                 FROM targets t
-                JOIN programs p ON p.handle = t.program_handle
-                WHERE p.archived = 0
-                GROUP BY t.program_handle, t.asset_type
+                JOIN programs p
+                  ON p.source = t.source AND p.handle = t.program_handle
+                WHERE p.archived = 0{extra2}
+                GROUP BY t.source, t.program_handle, t.asset_type
                 ORDER BY total DESC
-                """
+                """,
+                params2,
             ).fetchall()
     return [dict(r) for r in rows]
 
@@ -388,6 +515,7 @@ def update_finding_status(
 def list_findings(
     status: str | None = None,
     program_handle: str | None = None,
+    source: str | None = None,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
     where: list[str] = []
@@ -398,12 +526,16 @@ def list_findings(
     if program_handle:
         where.append("t.program_handle = ?")
         params.append(program_handle)
+    if source:
+        where.append("t.source = ?")
+        params.append(source)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     params.append(limit)
     with get_conn() as conn:
         rows = conn.execute(
             f"""
             SELECT f.*,
+                   t.source,
                    t.program_handle,
                    t.asset_type,
                    t.identifier AS target_identifier

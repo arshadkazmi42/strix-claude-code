@@ -17,6 +17,7 @@ from mcp.types import TextContent, Tool
 # form works in both script and module contexts.
 from strix_cli_claude import db as _h1_db
 from strix_cli_claude.h1_client import H1Client, H1Error
+from strix_cli_claude.intigriti_client import IntigritiClient, IntigritiError
 
 logger = logging.getLogger(__name__)
 
@@ -595,10 +596,12 @@ After it returns, list_files /workspace/<name> and start your whitebox review. D
 
 
 # ---------------------------------------------------------------------------
-# HackerOne / scan-queue / findings tools — backed by SQLite at ~/.strix
+# Bounty tools — HackerOne + Intigriti + scan queue + findings ledger.
+# Backed by SQLite at ~/.strix/strix.db. All tools run in-process; the
+# sandbox is not required to call any of them.
 # ---------------------------------------------------------------------------
 
-H1_TOOLS = [
+BOUNTY_TOOLS = [
     Tool(
         name="h1_sync_programs",
         description=(
@@ -613,8 +616,8 @@ H1_TOOLS = [
     Tool(
         name="h1_list_programs",
         description=(
-            "List programs currently stored in the local DB (after sync). "
-            "Optionally filter by substring of the program handle."
+            "List HackerOne programs currently stored in the local DB (after "
+            "sync). Optionally filter by substring of the program handle."
         ),
         inputSchema={
             "type": "object",
@@ -650,15 +653,20 @@ H1_TOOLS = [
     Tool(
         name="scope_summary",
         description=(
-            "Return counts grouped by (program, asset_type). If "
+            "Return counts grouped by (source, program, asset_type). If "
             "program_handle is given, returns per-asset-type totals plus a "
             "scan-status breakdown for that program only. Use to render the "
-            "scope picker at session start."
+            "scope picker. Optional `source` narrows to 'h1' or 'intigriti'."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "program_handle": {"type": "string"},
+                "source": {
+                    "type": "string",
+                    "enum": ["h1", "intigriti"],
+                    "description": "Limit to one platform",
+                },
             },
             "additionalProperties": False,
         },
@@ -674,6 +682,11 @@ H1_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["h1", "intigriti"],
+                    "description": "Limit to one platform",
+                },
                 "program_handles": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -721,11 +734,14 @@ H1_TOOLS = [
         name="scan_status",
         description=(
             "Return scan-status counts (pending / in_progress / done / "
-            "skipped / error). Optionally scoped to a single program."
+            "skipped / error). Optionally scoped to a single program and/or platform."
         ),
         inputSchema={
             "type": "object",
-            "properties": {"program_handle": {"type": "string"}},
+            "properties": {
+                "program_handle": {"type": "string"},
+                "source": {"type": "string", "enum": ["h1", "intigriti"]},
+            },
             "additionalProperties": False,
         },
     ),
@@ -787,25 +803,65 @@ H1_TOOLS = [
         name="finding_list",
         description=(
             "List findings. Filter by status (candidate|confirmed|rejected|"
-            "submitted|duplicate) and/or program_handle. Use this to review "
-            "what's ready to submit on hackerone.com."
+            "submitted|duplicate), program_handle, and/or source. Use this to "
+            "review what's ready to submit on hackerone.com or intigriti.com."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "status": {"type": "string"},
                 "program_handle": {"type": "string"},
+                "source": {"type": "string", "enum": ["h1", "intigriti"]},
                 "limit": {"type": "integer", "default": 200},
             },
             "additionalProperties": False,
         },
     ),
+    Tool(
+        name="intigriti_sync_programs",
+        description=(
+            "Pull all programs and their scopes from the Intigriti researcher "
+            "API and upsert into local SQLite under source='intigriti'. Requires "
+            "INTIGRITI_TOKEN in the MCP server's environment. Returns counts."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
+        name="intigriti_list_programs",
+        description=(
+            "List Intigriti programs stored in the local DB (after sync). "
+            "Optionally filter by substring of the program handle "
+            "(handles are 'company/program' style)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "handle_filter": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="intigriti_get_scope",
+        description=(
+            "Return all in-scope assets for a single Intigriti program from the "
+            "local DB (after sync). Handle is 'company/program' style."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "program_handle": {"type": "string"},
+            },
+            "required": ["program_handle"],
+            "additionalProperties": False,
+        },
+    ),
 ]
 
-PENTEST_TOOLS = PENTEST_TOOLS + H1_TOOLS
+PENTEST_TOOLS = PENTEST_TOOLS + BOUNTY_TOOLS
 
 
-H1_TOOL_NAMES = {t.name for t in H1_TOOLS}
+BOUNTY_TOOL_NAMES = {t.name for t in BOUNTY_TOOLS}
 
 
 def create_server() -> Server:
@@ -829,7 +885,7 @@ def create_server() -> Server:
         nonlocal tool_client
 
         # H1 / scan-queue / findings tools (host-local, no sandbox needed)
-        if name in H1_TOOL_NAMES:
+        if name in BOUNTY_TOOL_NAMES:
             return await handle_h1_tool(name, arguments)
 
         # Handle local tools (write to host filesystem)
@@ -1429,6 +1485,7 @@ def create_server() -> Server:
                                 policy_url=p["policy_url"],
                                 offers_bounty=p["offers_bounty"],
                                 submission_state=p.get("submission_state"),
+                                source="h1",
                             )
                             handles.append(p["handle"])
                             programs_synced += 1
@@ -1451,17 +1508,77 @@ def create_server() -> Server:
                                     eligible_for_bounty=s["eligible_for_bounty"],
                                     max_severity=s.get("max_severity"),
                                     instruction=s.get("instruction"),
+                                    source="h1",
                                 )
                                 targets_synced += 1
 
-                _h1_db.mark_programs_archived_except(handles)
+                _h1_db.mark_programs_archived_except(handles, source="h1")
                 return _txt({
+                    "source": "h1",
+                    "programs_synced": programs_synced,
+                    "targets_synced": targets_synced,
+                })
+
+            if name == "intigriti_sync_programs":
+                programs_synced = 0
+                targets_synced = 0
+                handles: list[str] = []
+                with IntigritiClient() as client:
+                    programs = client.list_programs()
+                    with _h1_db.get_conn() as conn:
+                        for p in programs:
+                            _h1_db.upsert_program(
+                                conn,
+                                handle=p["handle"],
+                                name=p["name"],
+                                policy_url=p.get("policy_url"),
+                                offers_bounty=p["offers_bounty"],
+                                submission_state=p.get("submission_state"),
+                                source="intigriti",
+                            )
+                            handles.append(p["handle"])
+                            programs_synced += 1
+
+                    for p in programs:
+                        try:
+                            scopes = client.get_program_scope(p["id"])
+                        except IntigritiError as e:
+                            logger.warning("scope fetch failed for %s: %s", p["handle"], e)
+                            continue
+                        with _h1_db.get_conn() as conn:
+                            for s in scopes:
+                                if not s.get("eligible_for_submission"):
+                                    continue
+                                _h1_db.upsert_target(
+                                    conn,
+                                    program_handle=p["handle"],
+                                    asset_type=s["asset_type"],
+                                    identifier=s["asset_identifier"],
+                                    eligible_for_bounty=s["eligible_for_bounty"],
+                                    max_severity=s.get("max_severity"),
+                                    instruction=s.get("instruction"),
+                                    source="intigriti",
+                                )
+                                targets_synced += 1
+
+                _h1_db.mark_programs_archived_except(handles, source="intigriti")
+                return _txt({
+                    "source": "intigriti",
                     "programs_synced": programs_synced,
                     "targets_synced": targets_synced,
                 })
 
             if name == "h1_list_programs":
-                return _txt(_h1_db.list_programs(arguments.get("handle_filter")))
+                return _txt(_h1_db.list_programs(
+                    handle_filter=arguments.get("handle_filter"),
+                    source="h1",
+                ))
+
+            if name == "intigriti_list_programs":
+                return _txt(_h1_db.list_programs(
+                    handle_filter=arguments.get("handle_filter"),
+                    source="intigriti",
+                ))
 
             if name == "h1_get_scope":
                 handle = arguments.get("program_handle")
@@ -1471,18 +1588,37 @@ def create_server() -> Server:
                     rows = conn.execute(
                         "SELECT id, asset_type, identifier, eligible_for_bounty,"
                         " max_severity, instruction, scan_status, summary"
-                        " FROM targets WHERE program_handle=? ORDER BY asset_type, id",
+                        " FROM targets WHERE source='h1' AND program_handle=?"
+                        " ORDER BY asset_type, id",
+                        (handle,),
+                    ).fetchall()
+                return _txt([dict(r) for r in rows])
+
+            if name == "intigriti_get_scope":
+                handle = arguments.get("program_handle")
+                if not handle:
+                    return _txt("Error: program_handle is required")
+                with _h1_db.get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT id, asset_type, identifier, eligible_for_bounty,"
+                        " max_severity, instruction, scan_status, summary"
+                        " FROM targets WHERE source='intigriti' AND program_handle=?"
+                        " ORDER BY asset_type, id",
                         (handle,),
                     ).fetchall()
                 return _txt([dict(r) for r in rows])
 
             if name == "scope_summary":
-                return _txt(_h1_db.scope_summary(arguments.get("program_handle")))
+                return _txt(_h1_db.scope_summary(
+                    program_handle=arguments.get("program_handle"),
+                    source=arguments.get("source"),
+                ))
 
             if name == "scan_claim_next":
                 row = _h1_db.claim_next_target(
                     program_handles=arguments.get("program_handles"),
                     asset_types=arguments.get("asset_types"),
+                    source=arguments.get("source"),
                 )
                 return _txt({"target": row})
 
@@ -1502,7 +1638,10 @@ def create_server() -> Server:
                 return _txt({"ok": True, "target_id": int(target_id), "status": "skipped"})
 
             if name == "scan_status":
-                return _txt(_h1_db.scan_status_counts(arguments.get("program_handle")))
+                return _txt(_h1_db.scan_status_counts(
+                    program_handle=arguments.get("program_handle"),
+                    source=arguments.get("source"),
+                ))
 
             if name == "finding_create":
                 target_id = arguments.get("target_id")
@@ -1541,6 +1680,7 @@ def create_server() -> Server:
                 return _txt(_h1_db.list_findings(
                     status=arguments.get("status"),
                     program_handle=arguments.get("program_handle"),
+                    source=arguments.get("source"),
                     limit=int(arguments.get("limit") or 200),
                 ))
 
@@ -1548,8 +1688,10 @@ def create_server() -> Server:
 
         except H1Error as e:
             return _txt(f"Error (HackerOne API): {e}")
+        except IntigritiError as e:
+            return _txt(f"Error (Intigriti API): {e}")
         except Exception as e:
-            logger.exception("H1 tool '%s' failed", name)
+            logger.exception("bounty tool '%s' failed", name)
             return _txt(f"Error: {type(e).__name__}: {e}")
 
     return server
