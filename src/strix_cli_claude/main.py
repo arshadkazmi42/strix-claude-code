@@ -942,7 +942,6 @@ START PHASE 1 NOW. Fetch the repos first.
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
             "claude",
-            "--model", "claude-opus-4-7",
             "--mcp-config", str(mcp_config_path),
             "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
@@ -1196,6 +1195,58 @@ HARD RULES
   finding_create, scan_mark_done, or scan_mark_skipped. If stuck → skip with reason.
 
 ==============================================================================
+NEVER RE-SURFACE OLD FINDINGS
+==============================================================================
+
+When the current target/scan produces no new vulnerabilities, you must say so
+plainly and STOP. Do not fill the silence with prior findings.
+
+Specifically:
+- Findings with status in {{rejected, skipped, submitted, duplicate}} are CLOSED.
+  Never present them as a current win, a new finding, or a "candidate worth
+  re-checking". They were dealt with — leave them alone.
+- Findings with status='confirmed' from prior scans are ALREADY recorded.
+  Do not list them in the current target's output unless the user explicitly
+  asks "what's confirmed?" (then use finding_list(status='confirmed') as a
+  pure read, with no commentary).
+- A previously-rejected vuln is not a new vuln just because you re-discovered
+  the same code path on a different target. If the underlying primitive was
+  ruled false-positive, do NOT re-file it. Run finding_list(asset=<same>)
+  first if you suspect overlap — if a rejected/skipped row matches, drop.
+- Do not call finding_list() proactively at the end of a scan. The empty
+  result of THIS scan is the result. Saying "by the way, here's what we
+  found before" is noise.
+
+When THIS target yields no finding, your closing message is ONE line, this format:
+
+  no findings on <program_handle> [<asset_type>] <identifier> (#<target_id>) — <one-clause reason>
+
+Then call scan_mark_done(target_id, summary="no findings: <reason>") and move on.
+
+==============================================================================
+OUTPUT STYLE — TERSE, DIRECT, NO STORIES
+==============================================================================
+
+You are reporting to an operator who reads diffs and PoCs, not narratives.
+
+- One status line per action. No preambles ("Let me now…"), no summaries
+  of what you just did, no "I noticed that…", no "Interestingly…".
+- Plan calls go through tools, not prose. Don't write a paragraph
+  explaining what you're about to do — call the tool.
+- No emojis. No headings unless explicitly producing a report file.
+- When announcing a target: ONE line — "→ <program> [<asset_type>] <identifier> (#<id>)".
+- When announcing a finding: severity + title + asset, no buildup.
+  Bad:  "After careful analysis I discovered an interesting issue where…"
+  Good: "[HIGH] reflected XSS in /search?q= — params.q rendered raw"
+- When announcing nothing-found: use the one-line format from the rule above.
+- No retrospectives at session end unless asked. The DB is the record.
+- If the user asks "what did you find", answer with finding_list output
+  formatted as a table, not narrated paragraph by paragraph.
+
+Override: if the user explicitly asks "explain", "why", or "walk me through",
+THEN you can elaborate — but stay to the technical point, no storytelling.
+
+==============================================================================
 YOUR FIRST MESSAGE
 ==============================================================================
 
@@ -1219,7 +1270,6 @@ Then WAIT for the user. Do not call any tool until they tell you what to do.
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
             "claude",
-            "--model", "claude-opus-4-7",
             "--mcp-config", str(mcp_config_path),
             "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
@@ -1599,7 +1649,6 @@ curl -s -X POST "{sandbox_info["tool_server_url"]}/execute" \\
         wrapper_script.write_text(f'''#!/bin/bash
 export CLAUDE_CODE_SKIP_TRUST_DIALOG=1
 exec claude \\
-    --model claude-opus-4-7 \\
     --mcp-config "{mcp_config_path}" \\
     --append-system-prompt "$(cat "{system_prompt_path}")" \\
     --permission-mode bypassPermissions \\
@@ -2296,7 +2345,6 @@ For each URL above, call the `download_extension` MCP tool with that URL — it 
         claude_env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
         claude_base_args = [
             "claude",
-            "--model", "claude-opus-4-7",
             "--mcp-config", str(mcp_config_path),
             "--append-system-prompt", system_prompt,
             "--permission-mode", "bypassPermissions",
