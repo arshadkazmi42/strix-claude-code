@@ -433,6 +433,14 @@ body.locked{position:fixed;left:0;right:0;width:100%;overflow:hidden}
 .sheet.dark{background:var(--term);color:var(--term-ink)}
 .sheet h3{margin:2px 0 14px;font-size:16px;font-weight:700}
 .sheet.dark h3{color:var(--term-ink)}
+.sheethead{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:10px;
+margin:-18px -18px 12px;padding:13px 16px;border-bottom:1px solid var(--line);background:var(--card)}
+.sheet.dark .sheethead{background:var(--term2);border-color:var(--term-line)}
+.sheethead h3{margin:0;flex:1;font-size:16px;font-weight:700}
+.sheethead .x{position:static;float:none;font-size:24px;width:42px;height:42px;flex:none;
+border:1px solid var(--line);border-radius:10px;background:var(--bg2)}
+.sheet.dark .sheethead .x{background:rgba(255,255,255,.06);border-color:var(--term-line);color:var(--term-ink)}
+#recbox img,#recbox video{width:100%;max-height:58vh;object-fit:contain;border-radius:8px;background:#000;display:block}
 .quick{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
 .quick button{background:#f0ecff;border:1px solid #e0d8ff;color:var(--pc2);
 border-radius:999px;padding:9px 14px;font-size:13px;font-family:var(--mono);font-weight:600}
@@ -506,8 +514,7 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
 <div id=toast></div>
 
 <div class=overlay id=sendov onclick="if(event.target===this)close_('sendov')">
- <div class=sheet><button class=x onclick="close_('sendov')">&times;</button>
-  <h3 id=sendtitle>Send command</h3>
+ <div class=sheet><div class=sheethead><h3 id=sendtitle>Send command</h3><button class=x onclick="close_('sendov')">&times;</button></div>
   <div class=quick>
    <button onclick="qsend('work')">work</button>
    <button onclick="qsend('go')">go</button>
@@ -522,16 +529,15 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
 </div>
 
 <div class=overlay id=peekov onclick="if(event.target===this)close_('peekov')">
- <div class="sheet dark"><button class=x onclick="close_('peekov')">&times;</button>
-  <h3 id=peektitle>Peek</h3><div id=peekbox>loading…</div>
+ <div class="sheet dark"><div class=sheethead><h3 id=peektitle>Peek</h3><button class=x onclick="close_('peekov')">&times;</button></div><div id=peekbox>loading…</div>
   <button class=send onclick=peekRefresh()>Refresh</button>
  </div>
 </div>
 
 <div class=overlay id=recov onclick="if(event.target===this)close_('recov')">
- <div class="sheet dark"><button class=x onclick="close_('recov')">&times;</button>
-  <h3>PoC recording</h3><div id=recbox>loading…</div>
+ <div class="sheet dark"><div class=sheethead><h3>PoC recording</h3><button class=x onclick="close_('recov')">&times;</button></div><div id=recbox>loading…</div>
   <a id=recdl class=send style="display:block;text-align:center;text-decoration:none;margin-top:9px" target=_blank>Open raw</a>
+  <button class=send style="margin-top:8px;background:var(--surface2)" onclick="close_('recov')">Close</button>
  </div>
 </div>
 
@@ -638,6 +644,8 @@ async function openRec(id){
   const ct=(r.headers.get('content-type')||'').toLowerCase();
   if(ct.indexOf('video')===0){
    box.innerHTML='<video controls autoplay playsinline><source src="/recordings/'+id+'"></video>';
+  }else if(ct.indexOf('image')===0){
+   box.innerHTML='<img src="/recordings/'+id+'" alt="PoC recording">';
   }else{
    const t=await r.text(); box.textContent=t||'(empty recording)';
   }

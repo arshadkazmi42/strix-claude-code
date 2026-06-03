@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 RECORDINGS_DIR = Path.home() / ".strix" / "recordings"
 # Where the verifier session is told to drop its recording inside the sandbox.
 _REC_BASENAME = "poc_recording"
-_REC_EXTS = (".mp4", ".webm", ".cast", ".gif", ".txt")
+_REC_EXTS = (".mp4", ".webm", ".gif", ".png", ".cast", ".txt")
 
 _VERDICTS = ("VALID", "FALSE_POSITIVE", "INCONCLUSIVE")
 
@@ -53,48 +53,64 @@ def _driver_steps(asset_type: str, source_ref: str, commit_ref: str | None) -> s
     """Asset-type-specific setup + recording recipe."""
     at = (asset_type or "SOURCE_CODE").upper()
     commit = commit_ref or "(HEAD — record the exact SHA you land on)"
+    rec = f"/workspace/{_REC_BASENAME}"
+
+    # Reusable: set up a headed browser + screen recording to MP4 video.
+    browser_setup = f"""   ENV SETUP (do this, install whatever is missing — server's time, not the user's):
+     - apt-get update && apt-get install -y xvfb ffmpeg x11-utils >/dev/null
+     - install Playwright + Chromium:
+         (python) pip install playwright && playwright install --with-deps chromium
+         (or node) npm i -D playwright && npx playwright install --with-deps chromium
+     - start a virtual display:  Xvfb :99 -screen 0 1280x800x24 & ; export DISPLAY=:99
+     - start screen capture to VIDEO:
+         ffmpeg -y -f x11grab -video_size 1280x800 -framerate 12 -i :99 \\
+                -pix_fmt yuv420p {rec}.mp4 &   # kill it after the PoC: pkill -INT ffmpeg
+     PREFER recording real on-screen video to {rec}.mp4. If x11grab is impossible,
+     fall back to Playwright's built-in record_video_dir, then move the file to {rec}.webm."""
 
     if at == "CHROME_EXTENSION":
-        return f"""ASSET TYPE: Chrome extension.
-1. Fetch the extension source / .crx for: {source_ref}  (commit/version: {commit}).
-   Prove integrity: for a repo, `git diff` must be empty; for a published .crx,
-   note its exact version/hash. Do NOT edit the extension.
-2. Launch a REAL Chromium with the extension loaded, headed, via Playwright:
-     chromium.launchPersistentContext(..., args=[
-       f"--disable-extensions-except={{ext_dir}}",
-       f"--load-extension={{ext_dir}}"], record_video_dir="/workspace/rec")
-3. Build the clickjacking / attack page from the repro, open it, and perform the
-   exact hijacked action. The Playwright video IS the PoC recording.
-4. Save the recording to /workspace/{_REC_BASENAME}.webm (rename Playwright's file)."""
+        return f"""ASSET TYPE: Chrome extension — must be shown in a REAL browser, on VIDEO.
+1. Fetch the extension for: {source_ref} (version/commit: {commit}). For a repo,
+   `git diff` MUST be empty; for a published .crx, note exact version+hash. Do NOT edit it.
+{browser_setup}
+2. Launch a HEADED Chromium with the extension loaded (headless cannot load MV3 UI):
+     chromium.launchPersistentContext(userDataDir, headless=False, args=[
+       f"--disable-extensions-except={{ext_dir}}", f"--load-extension={{ext_dir}}"])
+3. Build the EXACT attack page from the repro (e.g. the clickjacking iframe), open it,
+   and perform the hijacked action SLOWLY and visibly so the video clearly shows:
+   the extension UI, the overlay/iframe, and the unintended action firing.
+4. Stop ffmpeg. The MP4 at {rec}.mp4 must clearly show the attack working."""
 
     if at == "VSCODE_EXTENSION":
-        return f"""ASSET TYPE: VS Code extension.
-1. Clone {source_ref} at {commit}; prove `git diff` is empty. Do NOT modify it.
-2. Run it in a real Extension Host using @vscode/test-electron (or `code
-   --extensionDevelopmentPath=. --new-window`) under Xvfb, recording the screen
-   (ffmpeg x11grab to /workspace/{_REC_BASENAME}.mp4).
-3. Trigger the exact repro (malicious workspace file / command / webview) and
-   capture the impact on video."""
+        return f"""ASSET TYPE: VS Code extension — shown in a REAL VS Code window, on VIDEO.
+1. Clone {source_ref} at {commit}; `git diff` MUST be empty. Do NOT modify it. Install deps.
+{browser_setup}
+2. Launch the extension in a real Extension Development Host under the virtual display:
+     download VS Code (or use `code`/code-server), then
+     code --extensionDevelopmentPath=$PWD --disable-workspace-trust <malicious-workspace>
+   (or @vscode/test-electron). Make sure the VS Code window renders on :99.
+3. Trigger the EXACT repro (malicious .vscode/ file, command, or webview) and let the
+   video show the impact (e.g. command execution marker, exfil, rogue webview).
+4. Stop ffmpeg. {rec}.mp4 must clearly show the bug firing inside VS Code."""
 
     if at in ("URL", "DOMAIN"):
-        return f"""ASSET TYPE: live {at}.
-NOTE: you cannot prove "pristine source" for a live target — verify against the
-live endpoint instead, and say so in the evidence.
+        return f"""ASSET TYPE: live {at} (cannot prove pristine source — verify against the live target; say so).
 1. Target: {source_ref}.
-2. Drive a headed browser via Playwright with record_video_dir="/workspace/rec"
-   (for web UI bugs) OR capture the raw request/response with curl (for API bugs).
-3. Run the exact repro and capture the impact. Save recording to
-   /workspace/{_REC_BASENAME}.webm (browser) or the request/response transcript to
-   /workspace/{_REC_BASENAME}.txt (API)."""
+2. For a web-UI bug: {browser_setup}
+   then drive a HEADED browser to the page and perform the repro on video ({rec}.mp4).
+   For an API bug: capture the exact request+response with curl -v into {rec}.txt.
+3. The recording must clearly demonstrate the impact."""
 
     if at == "NPM":
-        return f"""ASSET TYPE: npm package.
-1. In a clean dir, install the EXACT published version under test ({source_ref}
-   @ {commit}). Do NOT patch node_modules.
-2. Write the minimal attacker script that drives the public API to trigger the
-   bug, run it with `script -c '...' /workspace/{_REC_BASENAME}.txt` (or asciinema
-   to /workspace/{_REC_BASENAME}.cast) to record the terminal.
-3. The output must show the impact (RCE marker file, prototype pollution, etc.)."""
+        return f"""ASSET TYPE: npm package (terminal PoC).
+1. In a clean dir, install the EXACT published version ({source_ref} @ {commit}).
+   Do NOT patch node_modules.
+2. Write a MINIMAL, readable attacker script (/workspace/poc.js) that drives only the
+   public API to trigger the bug.
+3. Record a CLEAN labelled terminal transcript:
+     script -q -c 'bash /workspace/poc.sh' {rec}.txt
+   where poc.sh echoes a banner before each step (see RECORDING QUALITY) and ends by
+   printing the concrete impact (RCE marker file contents, polluted prototype, etc.)."""
 
     # Default: source code (web app / service / CLI)
     return f"""ASSET TYPE: source code.
@@ -104,14 +120,15 @@ live endpoint instead, and say so in the evidence.
 2. Stand the app up using ITS OWN recipe, in priority order:
      a) docker-compose.yml  -> `docker compose up -d`
      b) .devcontainer / Dockerfile -> build & run
-     c) the CI workflow under .github/workflows (it lists the exact working steps)
+     c) the CI workflow under .github/workflows (the exact working steps)
      d) README run instructions
    Install whatever the project's manifests declare; iterate on build errors.
-3. Reproduce the bug against the RUNNING, unmodified app:
-     - web UI  -> headed Playwright with record_video_dir="/workspace/rec"
-     - HTTP API -> curl, saving request+response to /workspace/{_REC_BASENAME}.txt
-     - CLI      -> `script -c '<cmd>' /workspace/{_REC_BASENAME}.txt`
-4. Save the screen recording / transcript to /workspace/{_REC_BASENAME}.* """
+3. Reproduce against the RUNNING, unmodified app and record CLEANLY:
+     - web UI -> {browser_setup}
+                 then drive a HEADED browser through the repro on video ({rec}.mp4).
+     - HTTP API / CLI -> write /workspace/poc.sh with a labelled banner per step and
+                 record:  script -q -c 'bash /workspace/poc.sh' {rec}.txt
+4. The recording must end by clearly showing the impact."""
 
 
 def build_verifier_prompt(finding: dict) -> str:
@@ -150,9 +167,22 @@ NON-NEGOTIABLE RULES (this is the whole point):
 
 {_driver_steps(asset_type, source_ref, commit_ref)}
 
+RECORDING QUALITY (the recording is what the human reviews INSTEAD of redoing your work — make it good):
+  - Clean and STEP-BY-STEP, like a short demo. Keep build/install noise OUT of it (redirect to /dev/null).
+  - Prefer a real VIDEO (.mp4) for ANYTHING with a UI — web app, Chrome extension, VS Code extension.
+    Use a terminal transcript (.txt) only for pure CLI/API bugs.
+  - For terminal PoCs, write /workspace/poc.sh that prints a clear banner before each step, e.g.:
+        echo; echo "===== STEP 1: prove pristine source ====="; git -C target diff --quiet && echo PRISTINE_OK
+        echo; echo "===== STEP 2: start the target ====="; <cmd>
+        echo; echo "===== STEP 3: fire the PoC ====="; <the exact attack>
+        echo; echo "===== RESULT: <impact in one line> ====="
+    then record it with: script -q -c 'bash /workspace/poc.sh' /workspace/{_REC_BASENAME}.txt
+  - For video, perform each action SLOWLY and visibly so the impact is unmistakable on screen.
+
 DELIVERABLES (do these, in order):
   1. Stand it up pristine and reproduce (or fail to).
-  2. Make sure the recording is at /workspace/{_REC_BASENAME}.<ext> (mp4/webm/cast/txt).
+  2. Produce ONE clean recording at /workspace/{_REC_BASENAME}.<ext> — .mp4 (video, preferred for UI)
+     or .txt (labelled transcript for CLI/API).
   3. End your FINAL message with EXACTLY these lines and nothing after:
 
      VERDICT: <VALID|FALSE_POSITIVE|INCONCLUSIVE>
