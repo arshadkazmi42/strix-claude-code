@@ -441,10 +441,11 @@ border-radius:999px;padding:9px 14px;font-size:13px;font-family:var(--mono);font
 background:#fbfaf6;color:var(--ink);font-size:16px;font-family:var(--mono)}
 .sheet .send{width:100%;padding:13px;margin-top:10px;border:0;border-radius:12px;
 background:var(--pc);color:#fff;font-weight:700;font-size:15px;font-family:var(--sans)}
-#peekbox{white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:var(--term-ink);
+#peekbox,#recbox{white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:var(--term-ink);
 background:#06070d;border:1px solid var(--term-line);border-radius:11px;padding:11px;
 max-height:64vh;overflow-y:auto;line-height:1.45;
 -webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y}
+#recbox video{width:100%;border-radius:8px;background:#000}
 .sheet .x{float:right;background:none;border:0;color:var(--muted);font-size:24px;line-height:1}
 .sheet.dark .x{color:var(--term-muted)}
 </style></head><body>
@@ -524,6 +525,13 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
  <div class="sheet dark"><button class=x onclick="close_('peekov')">&times;</button>
   <h3 id=peektitle>Peek</h3><div id=peekbox>loading…</div>
   <button class=send onclick=peekRefresh()>Refresh</button>
+ </div>
+</div>
+
+<div class=overlay id=recov onclick="if(event.target===this)close_('recov')">
+ <div class="sheet dark"><button class=x onclick="close_('recov')">&times;</button>
+  <h3>PoC recording</h3><div id=recbox>loading…</div>
+  <a id=recdl class=send style="display:block;text-align:center;text-decoration:none;margin-top:9px" target=_blank>Open raw</a>
  </div>
 </div>
 
@@ -622,7 +630,19 @@ function show(t){activeTab=t;document.querySelectorAll('[data-view]').forEach(e=
 // actions
 async function setF(id,st){try{await post('/api/finding',{id,status:st});toast(st==='confirmed'?'Confirmed ✓':'Rejected','ok');refresh();}catch(e){toast('failed','err');}}
 async function verifyF(id){try{await post('/api/verify',{id});toast('verification queued — isolated repro running','ok');refresh();}catch(e){toast('verify failed','err');}}
-function openRec(id){window.open('/recordings/'+id,'_blank');}
+async function openRec(id){
+ const box=$('recbox'); $('recdl').href='/recordings/'+id;
+ box.textContent='loading…'; $('recov').classList.add('show'); lockBody();
+ try{
+  const r=await api('/recordings/'+id);
+  const ct=(r.headers.get('content-type')||'').toLowerCase();
+  if(ct.indexOf('video')===0){
+   box.innerHTML='<video controls autoplay playsinline><source src="/recordings/'+id+'"></video>';
+  }else{
+   const t=await r.text(); box.textContent=t||'(empty recording)';
+  }
+ }catch(e){ box.textContent='could not load recording'; }
+}
 let _sy=0;
 function lockBody(){_sy=window.scrollY;document.body.style.top=(-_sy)+'px';document.body.classList.add('locked');}
 function unlockBody(){document.body.classList.remove('locked');document.body.style.top='';window.scrollTo(0,_sy);}
@@ -841,7 +861,9 @@ def api_recording(finding_id: int):
     rec = f.get("verify_recording") if f else None
     if not rec or not Path(rec).exists():
         return PlainTextResponse("no recording", status_code=404)
-    return FileResponse(rec, filename=Path(rec).name)
+    # Serve INLINE (no attachment) so it renders in the sheet — video plays,
+    # text/cast transcripts display.
+    return FileResponse(rec, content_disposition_type="inline")
 
 
 @app.post("/api/launch")
