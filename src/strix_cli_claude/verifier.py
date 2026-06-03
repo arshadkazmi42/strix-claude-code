@@ -167,17 +167,24 @@ NON-NEGOTIABLE RULES (this is the whole point):
 
 {_driver_steps(asset_type, source_ref, commit_ref)}
 
-RECORDING QUALITY (the recording is what the human reviews INSTEAD of redoing your work — make it good):
-  - Clean and STEP-BY-STEP, like a short demo. Keep build/install noise OUT of it (redirect to /dev/null).
-  - Prefer a real VIDEO (.mp4) for ANYTHING with a UI — web app, Chrome extension, VS Code extension.
-    Use a terminal transcript (.txt) only for pure CLI/API bugs.
-  - For terminal PoCs, write /workspace/poc.sh that prints a clear banner before each step, e.g.:
-        echo; echo "===== STEP 1: prove pristine source ====="; git -C target diff --quiet && echo PRISTINE_OK
-        echo; echo "===== STEP 2: start the target ====="; <cmd>
-        echo; echo "===== STEP 3: fire the PoC ====="; <the exact attack>
-        echo; echo "===== RESULT: <impact in one line> ====="
-    then record it with: script -q -c 'bash /workspace/poc.sh' /workspace/{_REC_BASENAME}.txt
-  - For video, perform each action SLOWLY and visibly so the impact is unmistakable on screen.
+RECORDING QUALITY (the recording is what the human reviews INSTEAD of redoing your work — make it CLEAN):
+  TWO PHASES — this is the whole trick to a clean recording:
+    PHASE A — PREPARE, and DO NOT RECORD: clone, install, build, and START the target. ALL the
+      noisy setup (apt, npm, pip, docker compose up, build logs) happens here, OFF-camera.
+      Confirm the target is fully up BEFORE you start any recording.
+    PHASE B — DEMO, record ONLY this: a tiny run that assumes everything is already up and does
+      nothing but SHOW the attack. NEVER put installs/builds/`docker compose up` inside the recording.
+  - Prefer real VIDEO (.mp4) for ANYTHING with a UI. Use a .txt transcript only for pure CLI/API bugs.
+  - For a terminal demo, write /workspace/poc.sh that is SHORT and QUIET — banner, one command, result:
+        set +x
+        echo "===== STEP 1: prove pristine ====="; git -C /workspace/target diff --quiet && echo PRISTINE_OK
+        echo "===== STEP 2: fire the PoC =====";   <the single attack command>
+        echo "===== RESULT: <impact in one line> ====="; <print ONLY the line that proves impact>
+      Suppress every command's noise (append 2>/dev/null, grep to the key line). The script must be
+      ~5-15 lines of OUTPUT total. Then record JUST this script:
+        script -q -c 'bash /workspace/poc.sh' /workspace/{_REC_BASENAME}.txt
+  - For VIDEO, start ffmpeg only AFTER setup is finished; perform each action slowly/visibly; then stop
+    ffmpeg. The recording must be SECONDS of clear demo, never minutes of setup scrolling by.
 
 DELIVERABLES (do these, in order):
   1. Stand it up pristine and reproduce (or fail to).
