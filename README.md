@@ -6,6 +6,7 @@ AI-powered penetration testing using the Claude CLI tool. This is a companion to
 
 Strix Claude Code provides:
 - **TUI Dashboard**: Terminal UI for managing multiple scans
+- **Web Dashboard (PWA)**: Optional mobile-friendly control panel for live sessions and findings (see below)
 - A Docker sandbox with Kali Linux and comprehensive security tools
 - MCP (Model Context Protocol) server exposing pen testing tools to Claude
 - System prompts optimized for security assessment
@@ -33,6 +34,9 @@ Strix Claude Code provides:
 ```bash
 cd strix-claude-code
 pip install -e .
+
+# Optional: also install the web dashboard extras (fastapi + uvicorn)
+pip install -e ".[web]"
 ```
 
 ## Quick Start: TUI Dashboard
@@ -63,6 +67,95 @@ This launches an interactive dashboard where you can:
 | `q` | Quit the TUI |
 
 When attached to a scan, press `Ctrl+A` then `D` to detach and return to the TUI.
+
+## Web Dashboard (Mobile PWA)
+
+An optional, installable web dashboard for monitoring and controlling your hunter
+sessions from a phone or any browser. It shows your **running `screen` sessions**
+(live, straight from `screen -list`) and **latest findings** (from
+`~/.strix/strix.db`), and lets you peek into any session, send commands to it,
+stop it, triage findings (confirm/reject), and launch new scans.
+
+> **Additive & safe** — it only *reads* the existing sessions/DB and shells out to
+> the same `screen` commands. It does not change any CLI behaviour. Installing or
+> running it is entirely optional.
+
+### Install
+
+```bash
+pip install -e ".[web]"     # adds fastapi + uvicorn
+```
+
+### Run
+
+```bash
+# Foreground (Ctrl+C to stop)
+scripts/strix-web.sh start
+
+# Detached in a screen session named "strix-app" (survives logout)
+scripts/strix-web.sh start --screen
+
+# Manage it
+scripts/strix-web.sh status
+scripts/strix-web.sh logs
+scripts/strix-web.sh stop
+scripts/strix-web.sh restart --screen
+```
+
+Or run the installed entry point directly:
+
+```bash
+strix-claude-web                        # binds 0.0.0.0:8800
+STRIX_WEB_PORT=9000 strix-claude-web    # custom port
+```
+
+Then open `http://<server-ip>:8800` in a browser.
+
+### Password
+
+The dashboard is protected by a **single shared password**. The first run creates
+the password file with the default password **`changeme`** — change it before
+exposing the port.
+
+```bash
+# Recommended: use the helper (prompts, or pass it inline)
+scripts/strix-web.sh set-password
+scripts/strix-web.sh set-password 'my-strong-pass'
+
+# Or edit the file directly (first line is the password)
+echo 'my-strong-pass' > ~/.strix/web_password && chmod 600 ~/.strix/web_password
+
+# Or override with an env var (takes precedence over the file)
+STRIX_WEB_PASSWORD='my-strong-pass' strix-claude-web
+```
+
+Password changes apply **immediately** — no restart needed (it is re-read per request).
+
+| Source  | Path / variable                      | Precedence |
+|---------|--------------------------------------|------------|
+| Env var | `STRIX_WEB_PASSWORD`                 | highest    |
+| File    | `~/.strix/web_password` (first line) | default (`changeme`) |
+
+### Configuration
+
+| Variable             | Default     | Purpose                                                        |
+|----------------------|-------------|----------------------------------------------------------------|
+| `STRIX_WEB_HOST`     | `0.0.0.0`   | Bind address                                                   |
+| `STRIX_WEB_PORT`     | `8800`      | Port                                                           |
+| `STRIX_WEB_PASSWORD` | *(unset)*   | Overrides the password file                                    |
+| `STRIX_WEB_SCREEN`   | `strix-app` | Launcher's screen name; this session is hidden from the list   |
+
+### Install as a phone app (PWA)
+
+Open the dashboard in your mobile browser, then **Add to Home Screen**. It launches
+fullscreen like a native app (manifest + service worker + icons included).
+
+### Security
+
+- Access is gated **only** by the single password. Keep the dashboard behind a
+  firewall, VPN/Tailscale, or a TLS reverse proxy. **Do not** expose port 8800 to
+  the public internet — especially with the default `changeme` password.
+- It can stop sessions and launch scans, so treat access as privileged.
 
 ## CLI Usage
 

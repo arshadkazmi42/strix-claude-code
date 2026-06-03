@@ -25,7 +25,7 @@ DB_PATH = DB_DIR / "strix.db"
 # How long a row may stay 'in_progress' before another claimer can steal it.
 STALE_CLAIM_SECONDS = 4 * 3600
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 VALID_SOURCES = ("h1", "intigriti")
 
@@ -59,14 +59,18 @@ def init_db() -> None:
         current = conn.execute("PRAGMA user_version").fetchone()[0]
 
         if current < 1:
-            # Fresh install — create v2 schema directly.
+            # Fresh install — create base (v2) schema directly.
             _create_v2_schema(conn)
-            conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            return
+            current = 2
 
         if current < 2:
             _migrate_v1_to_v2(conn)
-            conn.execute("PRAGMA user_version=2")
+            current = 2
+
+        if current < 3:
+            _migrate_v2_to_v3(conn)
+
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _create_v2_schema(conn: sqlite3.Connection) -> None:
@@ -537,7 +541,7 @@ def list_findings(
             SELECT f.*,
                    t.source,
                    t.program_handle,
-                   t.asset_type,
+                   t.asset_type AS target_asset_type,
                    t.identifier AS target_identifier
             FROM findings f
             JOIN targets  t ON t.id = f.target_id
@@ -548,3 +552,177 @@ def list_findings(
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# v3 migration: ad-hoc findings + verification state
+# ---------------------------------------------------------------------------
+
+# Synthetic program/target used for findings that don't come from a bounty
+# queue (org scans, single-target scans, ad-hoc). Lets ANY session persist
+# findings to the DB without a real H1/Intigriti target row.
+ADHOC_PROGRAM = "_adhoc"
+
+_V3_COLUMNS = {
+    "asset_type": "TEXT",          # SOURCE_CODE | CHROME_EXTENSION | VSCODE_EXTENSION | URL | NPM | ...
+    "source_ref": "TEXT",          # repo URL / extension id / target URL — what the verifier rebuilds
+    "commit_ref": "TEXT",          # exact commit/tag to clone pristine
+    "repro": "TEXT",               # concrete repro: request/payload/steps the verifier runs
+    "session_label": "TEXT",       # which strix session produced it
+    "scan_kind": "TEXT",           # org | bounty | single | verify | ...
+    "verify_status": "TEXT DEFAULT 'unverified'",  # unverified|queued|running|passed|failed|error|needs_input
+    "verify_verdict": "TEXT",      # VALID | FALSE_POSITIVE | INCONCLUSIVE
+    "verify_recording": "TEXT",    # host path to screen recording (mp4 / asciinema cast)
+    "verify_evidence": "TEXT",     # JSON/markdown: pristine proof, request/response, scope cite
+    "verify_log": "TEXT",          # progress log lines from the verifier
+    "verified_at": "INTEGER",
+}
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(findings)").fetchall()}
+    for name, decl in _V3_COLUMNS.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE findings ADD COLUMN {name} {decl}")
+    conn.execute(
+        "INSERT OR IGNORE INTO programs (source, handle, name, offers_bounty, archived) "
+        "VALUES ('h1', ?, 'Ad-hoc / non-bounty findings', 0, 0)",
+        (ADHOC_PROGRAM,),
+    )
+
+
+def _ensure_adhoc_target(
+    conn: sqlite3.Connection, asset_type: str, identifier: str
+) -> int:
+    """Get-or-create the ad-hoc target row for an arbitrary asset."""
+    conn.execute(
+        "INSERT OR IGNORE INTO programs (source, handle, name, offers_bounty, archived) "
+        "VALUES ('h1', ?, 'Ad-hoc / non-bounty findings', 0, 0)",
+        (ADHOC_PROGRAM,),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO targets "
+        "(source, program_handle, asset_type, identifier, eligible_for_bounty, scan_status) "
+        "VALUES ('h1', ?, ?, ?, 0, 'done')",
+        (ADHOC_PROGRAM, asset_type, identifier),
+    )
+    row = conn.execute(
+        "SELECT id FROM targets WHERE source='h1' AND program_handle=? "
+        "AND asset_type=? AND identifier=?",
+        (ADHOC_PROGRAM, asset_type, identifier),
+    ).fetchone()
+    return int(row["id"])
+
+
+def record_finding(
+    *,
+    title: str,
+    severity: str | None = None,
+    vuln_type: str | None = None,
+    asset: str | None = None,
+    source_ref: str | None = None,
+    commit_ref: str | None = None,
+    asset_type: str | None = None,
+    repro: str | None = None,
+    notes: str | None = None,
+    poc_path: str | None = None,
+    session_label: str | None = None,
+    scan_kind: str | None = None,
+    status: str = "candidate",
+    target_id: int | None = None,
+) -> int:
+    """Persist a finding from ANY session type.
+
+    If target_id is given (bounty queue), the finding is linked to it.
+    Otherwise an ad-hoc target is created from (asset_type, source_ref/asset),
+    so org/single/extension scans land in the DB too. De-dupes on
+    (target_id, title) so re-reporting the same vuln is a no-op.
+    """
+    at = (asset_type or "SOURCE_CODE").upper()
+    now = int(time.time())
+    with get_conn() as conn:
+        if target_id is None:
+            identifier = source_ref or asset or title
+            target_id = _ensure_adhoc_target(conn, at, identifier)
+
+        existing = conn.execute(
+            "SELECT id FROM findings WHERE target_id=? AND title=?",
+            (target_id, title),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE findings SET severity=COALESCE(?,severity), "
+                "vuln_type=COALESCE(?,vuln_type), asset=COALESCE(?,asset), "
+                "source_ref=COALESCE(?,source_ref), commit_ref=COALESCE(?,commit_ref), "
+                "asset_type=COALESCE(?,asset_type), repro=COALESCE(?,repro), "
+                "updated_at=? WHERE id=?",
+                (severity, vuln_type, asset, source_ref, commit_ref, at, repro,
+                 now, existing["id"]),
+            )
+            return int(existing["id"])
+
+        cur = conn.execute(
+            """
+            INSERT INTO findings
+                (target_id, title, severity, vuln_type, asset, poc_path, notes, status,
+                 asset_type, source_ref, commit_ref, repro, session_label, scan_kind,
+                 verify_status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unverified', ?, ?)
+            """,
+            (target_id, title, severity, vuln_type, asset, poc_path, notes, status,
+             at, source_ref, commit_ref, repro, session_label, scan_kind, now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def get_finding(finding_id: int) -> dict[str, Any] | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT f.*, t.source, t.program_handle,
+                   t.asset_type AS target_asset_type,
+                   t.identifier AS target_identifier,
+                   t.instruction AS target_instruction
+            FROM findings f JOIN targets t ON t.id = f.target_id
+            WHERE f.id = ?
+            """,
+            (finding_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def set_verify_status(
+    finding_id: int, status: str, log_append: str | None = None
+) -> None:
+    now = int(time.time())
+    with get_conn() as conn:
+        if log_append:
+            conn.execute(
+                "UPDATE findings SET verify_status=?, "
+                "verify_log=COALESCE(verify_log,'') || ?, updated_at=? WHERE id=?",
+                (status, log_append.rstrip("\n") + "\n", now, finding_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE findings SET verify_status=?, updated_at=? WHERE id=?",
+                (status, now, finding_id),
+            )
+
+
+def set_verify_result(
+    finding_id: int,
+    verdict: str,
+    *,
+    status: str = "passed",
+    recording: str | None = None,
+    evidence: str | None = None,
+) -> None:
+    now = int(time.time())
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE findings SET verify_status=?, verify_verdict=?, "
+            "verify_recording=COALESCE(?,verify_recording), "
+            "verify_evidence=COALESCE(?,verify_evidence), "
+            "verified_at=?, updated_at=? WHERE id=?",
+            (status, verdict, recording, evidence, now, now, finding_id),
+        )

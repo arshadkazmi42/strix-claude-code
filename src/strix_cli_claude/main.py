@@ -229,7 +229,7 @@ TOOLS AVAILABLE:
 - browser_action: Control browser for web testing
 - list_requests / view_request / send_request / repeat_request: HTTP proxy control
 - str_replace_editor / list_files: View and edit files in /workspace
-- create_vulnerability_report: Document vulnerabilities with CVSS scoring (USE FOR ALL CONFIRMED VULNS)
+- create_vulnerability_report: Document vulnerabilities with CVSS scoring (USE FOR ALL CONFIRMED VULNS). This now ALSO saves the finding to the findings DB and queues it for AUTOMATED VERIFICATION — always fill asset_type, source_ref, commit_ref, and repro (see AUTO-VERIFICATION below).
 - write_report: Add general findings/notes to the report
 {docker_tools}
 METHODOLOGY:
@@ -261,6 +261,21 @@ DOCUMENT AS YOU GO - THIS IS CRITICAL:
 - Use create_note to save interesting observations for later investigation
 - If you find something suspicious but unconfirmed, use write_report to note it for follow-up
 - The report file is your persistent memory - use it frequently
+
+AUTO-VERIFICATION (CRITICAL — every create_vulnerability_report is queued for it):
+Each finding you report is persisted to a findings database and later handed to an
+isolated verifier that clones the target PRISTINE (unmodified), stands the env up, and
+re-runs your PoC against it to prove it is real. For that to work, ALWAYS include:
+  - asset_type   : SOURCE_CODE | CHROME_EXTENSION | VSCODE_EXTENSION | NPM | URL | DOMAIN
+  - source_ref   : the EXACT thing to rebuild — repo clone URL / extension id / target URL
+  - commit_ref   : the EXACT commit SHA or tag the bug exists at (so it is proven on unmodified code)
+  - repro        : concrete, copy-paste steps — exact request/payload/commands and what to observe
+HARD RULES for the repro (this is how a human triager thinks):
+  - NO "ifs", NO "could be", NO "likely". If you cannot make it actually trigger, do NOT report it.
+  - The PoC MUST work against the UNMODIFIED source. NEVER edit the target's code, tests, or config
+    to make a finding look real — the verifier clones fresh and checks `git diff` is empty; a tampered
+    finding is auto-rejected and wastes everyone's time.
+  - Prefer a real request→response or command→output that demonstrates impact over code reasoning.
 
 BUSINESS LOGIC ANALYSIS (Find what scanners miss):
 Before attacking, UNDERSTAND the application deeply:
@@ -690,22 +705,26 @@ Do NOT modify the .claude/CLAUDE.md file unless explicitly instructed by the use
     return base_prompt
 
 
-def create_mcp_config(tool_server_url: str, token: str, scan_id: str, output_file: str) -> dict[str, Any]:
+def create_mcp_config(tool_server_url: str, token: str, scan_id: str, output_file: str, extra_env: dict[str, str] | None = None) -> dict[str, Any]:
     """Create MCP configuration for Claude CLI."""
     # Get the path to the MCP server module
     mcp_server_path = Path(__file__).parent / "mcp_server.py"
+
+    env = {
+        "STRIX_TOOL_SERVER_URL": tool_server_url,
+        "STRIX_TOOL_SERVER_TOKEN": token,
+        "STRIX_AGENT_ID": f"claude-{scan_id}",
+        "STRIX_REPORT_FILE": output_file,
+    }
+    if extra_env:
+        env.update({k: v for k, v in extra_env.items() if v})
 
     return {
         "mcpServers": {
             "strix-pentest": {
                 "command": sys.executable,
                 "args": [str(mcp_server_path)],
-                "env": {
-                    "STRIX_TOOL_SERVER_URL": tool_server_url,
-                    "STRIX_TOOL_SERVER_TOKEN": token,
-                    "STRIX_AGENT_ID": f"claude-{scan_id}",
-                    "STRIX_REPORT_FILE": output_file,
-                },
+                "env": env,
             }
         }
     }
@@ -824,6 +843,7 @@ def _handle_org_scan(
             sandbox_info["tool_server_token"],
             sandbox_info["scan_id"],
             output_file,
+            extra_env={"STRIX_SCAN_KIND": "org", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-cli-{scan_id}")
@@ -1095,6 +1115,7 @@ def _handle_bounty_session(
             sandbox_info["tool_server_token"],
             sandbox_info["scan_id"],
             output_file,
+            extra_env={"STRIX_SCAN_KIND": "bounty", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
         )
 
         temp_config_dir = tempfile.mkdtemp(prefix=f"strix-bounty-{scan_id}")
@@ -1593,6 +1614,7 @@ def main(
             sandbox_info["tool_server_token"],
             sandbox_info["scan_id"],
             output_file,
+            extra_env={"STRIX_SCAN_KIND": "single", "STRIX_SESSION_LABEL": f"strix-{sandbox_info['scan_id']}"},
         )
 
         # Write MCP config to temp file

@@ -26,6 +26,12 @@ TOOL_SERVER_URL = os.getenv("STRIX_TOOL_SERVER_URL", "")
 TOOL_SERVER_TOKEN = os.getenv("STRIX_TOOL_SERVER_TOKEN", "")
 AGENT_ID = os.getenv("STRIX_AGENT_ID", "claude-cli-agent")
 REPORT_FILE = os.getenv("STRIX_REPORT_FILE", "")
+# Session context so EVERY session's findings land in the DB with enough
+# info for the auto-verifier to rebuild and reproduce them.
+SESSION_LABEL = os.getenv("STRIX_SESSION_LABEL", "")
+SCAN_KIND = os.getenv("STRIX_SCAN_KIND", "")            # org | single | bounty | extension | ...
+DEFAULT_ASSET_TYPE = os.getenv("STRIX_ASSET_TYPE", "")  # SOURCE_CODE | CHROME_EXTENSION | ...
+DEFAULT_SOURCE_REF = os.getenv("STRIX_SOURCE_REF", "")  # repo URL / extension id / target URL
 
 
 class ToolServerClient:
@@ -388,6 +394,15 @@ Include complete technical details and proof-of-concept code.""",
                 },
                 "endpoint": {"type": "string", "description": "Specific endpoint/URL affected"},
                 "method": {"type": "string", "description": "HTTP method if applicable"},
+                "vuln_type": {"type": "string", "description": "Short vuln class: xss, sqli, idor, rce, ssrf, clickjacking, dos, ..."},
+                "asset_type": {
+                    "type": "string",
+                    "enum": ["SOURCE_CODE", "CHROME_EXTENSION", "VSCODE_EXTENSION", "NPM", "URL", "DOMAIN", "OTHER"],
+                    "description": "What kind of asset this is in — drives auto-verification (how the env gets stood up).",
+                },
+                "source_ref": {"type": "string", "description": "Exact thing the verifier rebuilds: repo clone URL, extension id/url, or target URL."},
+                "commit_ref": {"type": "string", "description": "Exact commit SHA / tag to clone for PRISTINE verification (so the bug is proven against unmodified source)."},
+                "repro": {"type": "string", "description": "Concrete copy-paste reproduction: exact request/payload/commands and what to observe. NO 'ifs' — it must actually trigger the impact on unmodified code."},
             },
             "required": ["title", "description", "impact", "target", "technical_analysis", "poc_description", "poc_script_code", "remediation_steps", "attack_vector", "attack_complexity", "privileges_required", "user_interaction", "scope", "confidentiality", "integrity", "availability"],
         },
@@ -1132,9 +1147,42 @@ def create_server() -> Server:
                     existing += "\n## Findings\n"
                 report_path.write_text(existing + report_content)
 
+            # Persist to the SQLite findings DB so EVERY session (org, single,
+            # extension — not just bounty) produces a verifiable finding. A DB
+            # hiccup must never break the markdown report path sessions rely on.
+            db_msg = ""
+            if SCAN_KIND != "bounty":   # bounty sessions persist via finding_create
+                try:
+                    _h1_db.init_db()
+                    repro = arguments.get("repro") or "\n".join(
+                        x for x in [
+                            f"{method} {endpoint}".strip() if (endpoint or method) else "",
+                            poc_description, poc_script_code,
+                        ] if x
+                    )
+                    fid = _h1_db.record_finding(
+                        title=title,
+                        severity=severity,
+                        vuln_type=arguments.get("vuln_type"),
+                        asset=endpoint or target,
+                        source_ref=arguments.get("source_ref") or DEFAULT_SOURCE_REF or target,
+                        commit_ref=arguments.get("commit_ref"),
+                        asset_type=arguments.get("asset_type") or DEFAULT_ASSET_TYPE or "SOURCE_CODE",
+                        repro=repro,
+                        notes=description,
+                        poc_path=REPORT_FILE,
+                        session_label=SESSION_LABEL or None,
+                        scan_kind=SCAN_KIND or "scan",
+                        status="candidate",
+                    )
+                    db_msg = f"\nDB finding id: {fid} (queued for verification)"
+                except Exception as _e:
+                    logger.warning("record_finding failed: %s", _e)
+                    db_msg = f"\n(warning: could not persist to findings DB: {_e})"
+
             return [TextContent(
                 type="text",
-                text=f"Vulnerability report created: {title}\nSeverity: {severity.upper()} (CVSS {cvss_score:.1f})\nSaved to: {REPORT_FILE}"
+                text=f"Vulnerability report created: {title}\nSeverity: {severity.upper()} (CVSS {cvss_score:.1f})\nSaved to: {REPORT_FILE}{db_msg}"
             )]
 
         except Exception as e:
