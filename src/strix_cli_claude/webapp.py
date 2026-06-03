@@ -449,7 +449,7 @@ border-radius:999px;padding:9px 14px;font-size:13px;font-family:var(--mono);font
 background:#fbfaf6;color:var(--ink);font-size:16px;font-family:var(--mono)}
 .sheet .send{width:100%;padding:13px;margin-top:10px;border:0;border-radius:12px;
 background:var(--pc);color:#fff;font-weight:700;font-size:15px;font-family:var(--sans)}
-#peekbox,#recbox{white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:var(--term-ink);
+#peekbox,#recbox,#verbox{white-space:pre-wrap;font-family:var(--mono);font-size:11.5px;color:var(--term-ink);
 background:#06070d;border:1px solid var(--term-line);border-radius:11px;padding:11px;
 max-height:64vh;overflow-y:auto;line-height:1.45;
 -webkit-overflow-scrolling:touch;overscroll-behavior:contain;touch-action:pan-y}
@@ -534,6 +534,16 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
  </div>
 </div>
 
+<div class=overlay id=verov onclick="if(event.target===this)close_('verov')">
+ <div class="sheet dark"><div class=sheethead><h3 id=vertitle>Verification</h3><button class=x onclick="close_('verov')">&times;</button></div>
+  <div id=verstat class=sub style="margin-bottom:9px;color:var(--term-muted)">loading…</div>
+  <div id=verbox>…</div>
+  <div style="display:flex;gap:8px;margin-top:11px">
+   <button class=send style="flex:1;background:#3a2226;color:#ff7b72" onclick="stopVer()">&#9632; Stop</button>
+   <button class=send style="flex:1;background:var(--surface2)" onclick="close_('verov')">Close</button>
+  </div></div>
+</div>
+
 <div class=overlay id=recov onclick="if(event.target===this)close_('recov')">
  <div class="sheet dark"><div class=sheethead><h3>PoC recording</h3><button class=x onclick="close_('recov')">&times;</button></div><div id=recbox>loading…</div>
   <div style="display:flex;gap:8px;margin-top:11px">
@@ -581,15 +591,16 @@ function vChip(vs,verdict){
 }
 function findingCard(f){
  const vs=f.verify_status||'unverified';
- const vbadge=(vs && vs!=='unverified')?vChip(vs,f.verify_verdict):'';
  const busy=(vs==='queued'||vs==='running');
+ const vbadge=(vs && vs!=='unverified')?`<span onclick="openVerify(${f.id})" style="cursor:pointer">${vChip(vs,f.verify_verdict)}</span>`:'';
  const atype=f.asset_type?`<span class=badge>${esc(f.asset_type)}</span>`:'';
  return `<div class="fcard sev-${esc(f.severity)}">
   <div class=crow>${sevChip(f.severity)} ${stChip(f.status)} ${vbadge}<span class=sp></span><span class=age>${esc(f.age)}</span></div>
   <div class=title>${esc(f.title)}</div>
   <div class=sub>${esc(f.program||'—')}${f.asset?(' · '+esc(f.asset)):''} ${atype}</div>
   <div class=actions>
-   <button onclick="verifyF(${f.id})" ${busy?'disabled':''}>${busy?'Verifying…':'&#9889; Verify'}</button>
+   <button onclick="${busy?`openVerify(${f.id})`:`verifyF(${f.id})`}">${busy?'&#9203; Progress':(vs==='unverified'?'&#9889; Verify':'&#9889; Re-verify')}</button>
+   ${(vs&&vs!=='unverified'&&!busy)?`<button onclick="openVerify(${f.id})">&#9432; Log</button>`:''}
    ${f.recording?`<button class=go onclick="openRec(${f.id})">&#9654; Recording</button>`:''}
    ${f.notes?`<button onclick="this.closest('.fcard').querySelector('.notes').hidden^=1">Details</button>`:''}
   </div>
@@ -638,7 +649,29 @@ function show(t){activeTab=t;document.querySelectorAll('[data-view]').forEach(e=
 
 // actions
 async function setF(id,st){try{await post('/api/finding',{id,status:st});toast(st==='confirmed'?'Confirmed ✓':'Rejected','ok');refresh();}catch(e){toast('failed','err');}}
-async function verifyF(id){try{await post('/api/verify',{id});toast('verification queued — isolated repro running','ok');refresh();}catch(e){toast('verify failed','err');}}
+async function verifyF(id){try{await post('/api/verify',{id});toast('verification queued — isolated repro running','ok');refresh();setTimeout(()=>openVerify(id),400);}catch(e){toast('verify failed','err');}}
+let verId=0, verTimer=null;
+async function openVerify(id){
+ verId=id; $('vertitle').textContent='Verification · #'+id;
+ $('verstat').textContent='loading…'; $('verbox').textContent='';
+ $('verov').classList.add('show'); lockBody();
+ await verPoll(); clearInterval(verTimer); verTimer=setInterval(verPoll,3000);
+}
+async function verPoll(){
+ if(!$('verov').classList.contains('show')){clearInterval(verTimer);return;}
+ try{
+  const d=await getJSON('/api/verify-log/'+verId);
+  const alive=d.container?('🟢 '+d.container):'⚪ no container running';
+  let s='status: <b>'+esc(d.status)+'</b>'+(d.verdict?(' · '+esc(d.verdict)):'')+' · updated '+esc(d.updated_age)+' ago<br>'+alive;
+  if(d.evidence) s+='<br><br><b>evidence:</b> '+esc(d.evidence);
+  $('verstat').innerHTML=s;
+  const box=$('verbox'); const bottom=box.scrollTop+box.clientHeight>=box.scrollHeight-40;
+  box.textContent=d.log||'(no log yet — starting…)';
+  if(bottom) box.scrollTop=box.scrollHeight;
+ }catch(e){}
+}
+async function stopVer(){ if(!confirm('Force-stop this verification? (destroys its sandbox)'))return;
+ try{await post('/api/verify-stop',{id:verId});toast('stopping…','ok');verPoll();refresh();}catch(e){toast('stop failed','err');}}
 let recId=0;
 async function deleteRec(){
  if(!recId||!confirm('Delete this recording? The verdict stays; only the file is removed.'))return;
@@ -884,6 +917,54 @@ def api_recording(finding_id: int, download: bool = False):
     # Serve INLINE (no attachment) so it renders in the sheet — video plays,
     # text/cast transcripts display.
     return FileResponse(rec, content_disposition_type="inline")
+
+
+@app.get("/api/verify-log/{finding_id}")
+def api_verify_log(finding_id: int):
+    f = db.get_finding(finding_id)
+    if not f:
+        return JSONResponse({"error": "no finding"}, status_code=404)
+    log = ""
+    p = verifier.verify_log_path(finding_id)
+    if p.exists():
+        try:
+            log = p.read_text(errors="replace")[-16000:]
+        except Exception:
+            pass
+    container = ""
+    try:
+        out = subprocess.run(["docker", "ps", "--format", "{{.Names}} {{.Status}}"],
+                             capture_output=True, text=True, timeout=8).stdout
+        pref = verifier.verify_container_prefix(finding_id)
+        for ln in out.splitlines():
+            if ln.startswith(pref):
+                container = ln.strip()
+                break
+    except Exception:
+        pass
+    return JSONResponse({
+        "status": f.get("verify_status") or "unverified",
+        "verdict": f.get("verify_verdict") or "",
+        "evidence": (f.get("verify_evidence") or "")[:2000],
+        "updated_age": _age_epoch(f.get("updated_at")),
+        "container": container,
+        "recording": bool(f.get("verify_recording")),
+        "log": log,
+    })
+
+
+@app.post("/api/verify-stop")
+async def api_verify_stop(request: Request):
+    form = await _form(request)
+    try:
+        fid = int(form.get("id", ""))
+    except ValueError:
+        return PlainTextResponse("bad id", status_code=400)
+    try:
+        verifier.stop_verification(fid)
+    except Exception as e:
+        return PlainTextResponse(f"stop failed: {e}", status_code=500)
+    return PlainTextResponse("ok")
 
 
 @app.post("/api/recording/delete")

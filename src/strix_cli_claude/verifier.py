@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from strix_cli_claude import db
@@ -38,6 +39,30 @@ from strix_cli_claude import db
 logger = logging.getLogger(__name__)
 
 RECORDINGS_DIR = Path.home() / ".strix" / "recordings"
+
+
+def verify_log_path(finding_id: int) -> Path:
+    """Live progress log for a finding's verification (tailed by the UI)."""
+    return RECORDINGS_DIR / f"finding_{finding_id}_verify.log"
+
+
+def _flog(finding_id: int, text: str) -> None:
+    try:
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(verify_log_path(finding_id), "a", encoding="utf-8") as lf:
+            lf.write(text if text.endswith("\n") else text + "\n")
+    except Exception:
+        pass
+
+
+def _progress(finding_id: int, msg: str, status: str = "running") -> None:
+    """Record a milestone to BOTH the DB (status + short log) and the live log file."""
+    db.set_verify_status(finding_id, status, log_append=msg)
+    _flog(finding_id, f"[{time.strftime('%H:%M:%S')}] === {msg} ===")
+
+
+def verify_container_prefix(finding_id: int) -> str:
+    return f"strix-cli-verify-{finding_id}-"
 # Where the verifier session is told to drop its recording inside the sandbox.
 _REC_BASENAME = "poc_recording"
 _REC_EXTS = (".mp4", ".webm", ".gif", ".png", ".cast", ".txt")
@@ -245,9 +270,42 @@ def _extract_recording(container_name: str, finding_id: int) -> str | None:
 
 def launch_verification(finding_id: int) -> None:
     """Queue verification of a finding; runs in a daemon thread."""
+    # Start a fresh live log for this run.
+    try:
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        verify_log_path(finding_id).write_text(
+            f"[{time.strftime('%H:%M:%S')}] === queued for verification ===\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
     db.set_verify_status(finding_id, "queued", log_append="queued for verification")
     t = threading.Thread(target=_run_verification, args=(finding_id,), daemon=True)
     t.start()
+
+
+def stop_verification(finding_id: int) -> bool:
+    """Force-stop a stuck verification by removing its sandbox container(s).
+
+    Killing the sandbox tears down the tool server, so the headless verifier
+    session errors out and its thread unwinds.
+    """
+    prefix = verify_container_prefix(finding_id)
+    killed = False
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        for name in out.splitlines():
+            if name.strip().startswith(prefix):
+                subprocess.run(["docker", "rm", "-f", name.strip()],
+                               capture_output=True, timeout=30)
+                killed = True
+    except Exception:
+        pass
+    _progress(finding_id, "stopped by user", status="error")
+    return killed
 
 
 def _run_verification(finding_id: int) -> None:
@@ -268,7 +326,7 @@ def _run_verification(finding_id: int) -> None:
     sandbox: Sandbox | None = None
     temp_dir: str | None = None
     try:
-        db.set_verify_status(finding_id, "running", log_append="starting isolated sandbox")
+        _progress(finding_id, "starting isolated sandbox")
         # Docker socket mounted so the verifier can stand the target up with compose.
         sandbox = Sandbox(scan_id=scan_id, mount_docker_socket=True)
         info = sandbox.start()
@@ -283,19 +341,48 @@ def _run_verification(finding_id: int) -> None:
         cfg_path.write_text(json.dumps(mcp_config, indent=2))
 
         prompt = build_verifier_prompt(finding)
-        db.set_verify_status(finding_id, "running", log_append="reproducing on pristine source")
+        _progress(finding_id, "reproducing on pristine source — building env + running PoC (can take many minutes)")
 
         env = {**os.environ, "CLAUDE_CODE_SKIP_TRUST_DIALOG": "1"}
-        result = subprocess.run(
+        timeout_s = int(os.getenv("STRIX_VERIFY_TIMEOUT", "5400"))  # 90 min default
+        # Stream the verifier's live output to the log file so the UI can show
+        # real progress (and tell the run apart from a stuck one).
+        proc = subprocess.Popen(
             ["claude", "--mcp-config", str(cfg_path),
              "--append-system-prompt", prompt,
              "--permission-mode", "bypassPermissions",
-             "--dangerously-skip-permissions",
+             "--dangerously-skip-permissions", "--verbose",
              "--print", "Verify the finding now. Follow the deliverables exactly."],
-            cwd=temp_dir, env=env, capture_output=True, text=True,
-            timeout=int(os.getenv("STRIX_VERIFY_TIMEOUT", "5400")),  # 90 min default
+            cwd=temp_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
         )
-        out = (result.stdout or "") + "\n" + (result.stderr or "")
+        timed_out = {"v": False}
+
+        def _kill_proc() -> None:
+            timed_out["v"] = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        timer = threading.Timer(timeout_s, _kill_proc)
+        timer.start()
+        lines: list[str] = []
+        try:
+            with open(verify_log_path(finding_id), "a", encoding="utf-8") as lf:
+                for line in proc.stdout:  # live stream
+                    lines.append(line)
+                    lf.write(line)
+                    lf.flush()
+            proc.wait()
+        finally:
+            timer.cancel()
+
+        if timed_out["v"]:
+            _progress(finding_id, f"verification timed out after {timeout_s}s", status="error")
+            return
+
+        out = "".join(lines)
         verdict, evidence = parse_verdict(out)
         recording = _extract_recording(container_name, finding_id)
 
@@ -307,17 +394,12 @@ def _run_verification(finding_id: int) -> None:
             recording=recording,
             evidence=evidence or out[-1500:],
         )
-        db.set_verify_status(
-            finding_id, status,
-            log_append=f"verdict={verdict} recording={'yes' if recording else 'none'}",
-        )
+        _progress(finding_id, f"DONE — verdict={verdict} recording={'yes' if recording else 'none'}", status=status)
     except SandboxError as e:
-        db.set_verify_status(finding_id, "error", log_append=f"sandbox error: {e}")
-    except subprocess.TimeoutExpired:
-        db.set_verify_status(finding_id, "error", log_append="verification timed out")
+        _progress(finding_id, f"sandbox error: {e}", status="error")
     except Exception as e:  # noqa: BLE001
         logger.exception("verification failed")
-        db.set_verify_status(finding_id, "error", log_append=f"error: {e}")
+        _progress(finding_id, f"error: {e}", status="error")
     finally:
         if sandbox is not None:
             try:
