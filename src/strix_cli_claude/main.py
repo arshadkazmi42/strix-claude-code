@@ -1015,8 +1015,10 @@ def _bounty_state_block(platform: str | None) -> str:
         _bdb.init_db()
         h1_status = _bdb.scan_status_counts(source="h1")
         it_status = _bdb.scan_status_counts(source="intigriti")
+        bc_status = _bdb.scan_status_counts(source="bugcrowd")
         h1_programs_n = len(_bdb.list_programs(source="h1"))
         it_programs_n = len(_bdb.list_programs(source="intigriti"))
+        bc_programs_n = len(_bdb.list_programs(source="bugcrowd"))
         f_confirmed = len(_bdb.list_findings(status="confirmed"))
         f_candidate = len(_bdb.list_findings(status="candidate"))
         f_rejected = len(_bdb.list_findings(status="rejected"))
@@ -1035,6 +1037,7 @@ def _bounty_state_block(platform: str | None) -> str:
     lines = [
         _line("h1:", h1_programs_n, h1_status),
         _line("intigriti:", it_programs_n, it_status),
+        _line("bugcrowd:", bc_programs_n, bc_status),
         f"    findings:  {f_confirmed} confirmed | {f_candidate} candidate | {f_rejected} rejected",
     ]
     if platform:
@@ -1085,7 +1088,7 @@ def _handle_bounty_session(
         + "\n\n[bold]DB state:[/bold]\n"
         + state_block
         + f"\n\n[dim]DB: ~/.strix/strix.db   Output: {output_file}[/dim]\n"
-        + "[dim]No sync runs on entry. Type 'sync h1' or 'sync intigriti' in chat to refresh.[/dim]",
+        + "[dim]No sync runs on entry. Type 'sync h1', 'sync intigriti', or 'sync bugcrowd' in chat to refresh.[/dim]",
         title="Strix Claude Code — Bounty Mode",
     ))
 
@@ -1139,6 +1142,7 @@ You have the full set of pentest tools PLUS a persistent bounty ledger
 
   H1:        h1_sync_programs, h1_list_programs, h1_get_scope
   Intigriti: intigriti_sync_programs, intigriti_list_programs, intigriti_get_scope
+  Bugcrowd:  bugcrowd_sync_programs, bugcrowd_list_programs, bugcrowd_get_scope
   Queue:    scan_claim_next, scan_mark_done, scan_mark_skipped, scan_status, scope_summary
   Findings: finding_create, finding_confirm, finding_reject, finding_list
 
@@ -1159,7 +1163,8 @@ OPERATIONS — interpret user's natural language; they will not type tool names
 SYNC (only on explicit user request — never sync proactively):
   "sync h1"          → h1_sync_programs()
   "sync intigriti"   → intigriti_sync_programs()
-  "sync all"         → both, in sequence
+  "sync bugcrowd"    → bugcrowd_sync_programs()
+  "sync all"         → all three, in sequence
   Sync can take 1–5 minutes the first time. Do not retry on timeout; just wait.
 
 INSPECT (read-only; safe to call freely):
@@ -1280,7 +1285,7 @@ state block verbatim):
 
   Filters: platform={platform or 'any'}, programs={bounty_programs or 'any'}, asset_types={bounty_asset_types or 'any'}
 
-  What would you like? (sync h1 / sync intigriti / inspect / work / scan-one-off)
+  What would you like? (sync h1 / sync intigriti / sync bugcrowd / inspect / work / scan-one-off)
 
 Then WAIT for the user. Do not call any tool until they tell you what to do.
 """

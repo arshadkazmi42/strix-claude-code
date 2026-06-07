@@ -520,6 +520,7 @@ max-height:64vh;overflow-y:auto;line-height:1.45;
    <button onclick="qsend('go')">go</button>
    <button onclick="qsend('sync h1')">sync h1</button>
    <button onclick="qsend('sync intigriti')">sync intigriti</button>
+   <button onclick="qsend('sync bugcrowd')">sync bugcrowd</button>
    <button onclick="qsend('status')">status</button>
    <button onclick="qsend('continue')">continue</button>
   </div>

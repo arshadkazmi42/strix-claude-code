@@ -18,6 +18,7 @@ from mcp.types import TextContent, Tool
 from strix_cli_claude import db as _h1_db
 from strix_cli_claude.h1_client import H1Client, H1Error
 from strix_cli_claude.intigriti_client import IntigritiClient, IntigritiError
+from strix_cli_claude.bugcrowd_client import BugcrowdClient, BugcrowdError
 
 logger = logging.getLogger(__name__)
 
@@ -671,7 +672,7 @@ BOUNTY_TOOLS = [
             "Return counts grouped by (source, program, asset_type). If "
             "program_handle is given, returns per-asset-type totals plus a "
             "scan-status breakdown for that program only. Use to render the "
-            "scope picker. Optional `source` narrows to 'h1' or 'intigriti'."
+            "scope picker. Optional `source` narrows to 'h1', 'intigriti', or 'bugcrowd'."
         ),
         inputSchema={
             "type": "object",
@@ -679,7 +680,7 @@ BOUNTY_TOOLS = [
                 "program_handle": {"type": "string"},
                 "source": {
                     "type": "string",
-                    "enum": ["h1", "intigriti"],
+                    "enum": ["h1", "intigriti", "bugcrowd"],
                     "description": "Limit to one platform",
                 },
             },
@@ -699,7 +700,7 @@ BOUNTY_TOOLS = [
             "properties": {
                 "source": {
                     "type": "string",
-                    "enum": ["h1", "intigriti"],
+                    "enum": ["h1", "intigriti", "bugcrowd"],
                     "description": "Limit to one platform",
                 },
                 "program_handles": {
@@ -755,7 +756,7 @@ BOUNTY_TOOLS = [
             "type": "object",
             "properties": {
                 "program_handle": {"type": "string"},
-                "source": {"type": "string", "enum": ["h1", "intigriti"]},
+                "source": {"type": "string", "enum": ["h1", "intigriti", "bugcrowd"]},
             },
             "additionalProperties": False,
         },
@@ -826,7 +827,7 @@ BOUNTY_TOOLS = [
             "properties": {
                 "status": {"type": "string"},
                 "program_handle": {"type": "string"},
-                "source": {"type": "string", "enum": ["h1", "intigriti"]},
+                "source": {"type": "string", "enum": ["h1", "intigriti", "bugcrowd"]},
                 "limit": {"type": "integer", "default": 200},
             },
             "additionalProperties": False,
@@ -861,6 +862,46 @@ BOUNTY_TOOLS = [
         description=(
             "Return all in-scope assets for a single Intigriti program from the "
             "local DB (after sync). Handle is 'company/program' style."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "program_handle": {"type": "string"},
+            },
+            "required": ["program_handle"],
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="bugcrowd_sync_programs",
+        description=(
+            "Pull all public bug-bounty programs from the Bugcrowd engagements feed "
+            "and upsert into local SQLite under source='bugcrowd'. No auth needed for "
+            "programs. Per-program scope is imported only if BUGCROWD_TOKEN or "
+            "BUGCROWD_SESSION is set in the MCP server's environment (otherwise scope "
+            "is skipped). Returns counts."
+        ),
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+    ),
+    Tool(
+        name="bugcrowd_list_programs",
+        description=(
+            "List Bugcrowd programs stored in the local DB (after sync). "
+            "Optionally filter by substring of the program handle."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "handle_filter": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    ),
+    Tool(
+        name="bugcrowd_get_scope",
+        description=(
+            "Return all in-scope assets for a single Bugcrowd program from the "
+            "local DB (after sync). Empty unless scope was imported with a credential."
         ),
         inputSchema={
             "type": "object",
@@ -1656,6 +1697,84 @@ def create_server() -> Server:
                     ).fetchall()
                 return _txt([dict(r) for r in rows])
 
+            if name == "bugcrowd_sync_programs":
+                programs_synced = 0
+                targets_synced = 0
+                scope_note = ""
+                handles: list[str] = []
+                with BugcrowdClient() as client:
+                    programs = client.list_programs()
+                    with _h1_db.get_conn() as conn:
+                        for p in programs:
+                            _h1_db.upsert_program(
+                                conn,
+                                handle=p["handle"],
+                                name=p["name"],
+                                policy_url=p.get("policy_url"),
+                                offers_bounty=p["offers_bounty"],
+                                submission_state=p.get("submission_state"),
+                                source="bugcrowd",
+                            )
+                            handles.append(p["handle"])
+                            programs_synced += 1
+
+                    if client.authenticated:
+                        for p in programs:
+                            try:
+                                scopes = client.get_program_scope(p["handle"])
+                            except BugcrowdError as e:
+                                logger.warning("bugcrowd scope fetch failed for %s: %s", p["handle"], e)
+                                continue
+                            with _h1_db.get_conn() as conn:
+                                for s in scopes:
+                                    if not s.get("eligible_for_submission"):
+                                        continue
+                                    _h1_db.upsert_target(
+                                        conn,
+                                        program_handle=p["handle"],
+                                        asset_type=s["asset_type"],
+                                        identifier=s["asset_identifier"],
+                                        eligible_for_bounty=s["eligible_for_bounty"],
+                                        max_severity=s.get("max_severity"),
+                                        instruction=s.get("instruction"),
+                                        source="bugcrowd",
+                                    )
+                                    targets_synced += 1
+                    else:
+                        scope_note = (
+                            "scope skipped — set BUGCROWD_TOKEN or BUGCROWD_SESSION "
+                            "to import per-program scope"
+                        )
+                        logger.info("bugcrowd: %s", scope_note)
+
+                _h1_db.mark_programs_archived_except(handles, source="bugcrowd")
+                return _txt({
+                    "source": "bugcrowd",
+                    "programs_synced": programs_synced,
+                    "targets_synced": targets_synced,
+                    "note": scope_note,
+                })
+
+            if name == "bugcrowd_list_programs":
+                return _txt(_h1_db.list_programs(
+                    handle_filter=arguments.get("handle_filter"),
+                    source="bugcrowd",
+                ))
+
+            if name == "bugcrowd_get_scope":
+                handle = arguments.get("program_handle")
+                if not handle:
+                    return _txt("Error: program_handle is required")
+                with _h1_db.get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT id, asset_type, identifier, eligible_for_bounty,"
+                        " max_severity, instruction, scan_status, summary"
+                        " FROM targets WHERE source='bugcrowd' AND program_handle=?"
+                        " ORDER BY asset_type, id",
+                        (handle,),
+                    ).fetchall()
+                return _txt([dict(r) for r in rows])
+
             if name == "scope_summary":
                 return _txt(_h1_db.scope_summary(
                     program_handle=arguments.get("program_handle"),
@@ -1738,6 +1857,8 @@ def create_server() -> Server:
             return _txt(f"Error (HackerOne API): {e}")
         except IntigritiError as e:
             return _txt(f"Error (Intigriti API): {e}")
+        except BugcrowdError as e:
+            return _txt(f"Error (Bugcrowd): {e}")
         except Exception as e:
             logger.exception("bounty tool '%s' failed", name)
             return _txt(f"Error: {type(e).__name__}: {e}")

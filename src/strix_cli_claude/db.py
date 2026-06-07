@@ -27,7 +27,7 @@ STALE_CLAIM_SECONDS = 4 * 3600
 
 SCHEMA_VERSION = 3
 
-VALID_SOURCES = ("h1", "intigriti")
+VALID_SOURCES = ("h1", "intigriti", "bugcrowd")
 
 
 def _ensure_dir() -> None:
